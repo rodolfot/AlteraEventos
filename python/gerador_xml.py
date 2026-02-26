@@ -921,8 +921,19 @@ def construir_xml_enriquecimento(dados_por_aba):
                 cr_n.get("posfinal", "") or cr_n.get("posicaofinal", ""))
             _te(cr, "MapaDestino", cr_n.get("mapadestino", ""))
 
+        # Campos finais do DadoAcesso — ficam após todos os CampoRetornado
+        _te(da, "QuantidadeThreadsInicializacao",
+            rn.get("quantidadethreadsinicializacao", ""))
+        _te(da, "Prioridade",          rn.get("prioridade", ""))
+        _te(da, "PreencherComBrancos", rn.get("preenchercombrancos", ""))
+
     raw_xml = ET.tostring(root_el, encoding="unicode")
     pretty  = minidom.parseString(raw_xml).toprettyxml(indent="\t")
+    # Gabarito exige encoding="UTF-8" na declaração XML
+    pretty  = pretty.replace(
+        '<?xml version="1.0" ?>',
+        '<?xml version="1.0" encoding="UTF-8"?>'
+    )
 
     # Envolve ComandoSQL e SQLChave em CDATA
     def _to_cdata(xml_text, tag):
