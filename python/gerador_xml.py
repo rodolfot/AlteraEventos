@@ -110,21 +110,8 @@ def ler_campos_entrada(filepath):
         raise ValueError(f"Formato não suportado: {ext}")
 
 
-def _ler_xlsx_campos_entrada(filepath):
-    wb = openpyxl.load_workbook(filepath, data_only=True)
-
-    # Localiza a aba
-    sheet = None
-    for name in wb.sheetnames:
-        if _normalizar_chave(name) in ("camposentrada", "campos_entrada", "campos entrada"):
-            sheet = wb[name]
-            break
-    if sheet is None:
-        raise ValueError(
-            f"Aba 'Campos Entrada' não encontrada.\n"
-            f"Abas disponíveis: {', '.join(wb.sheetnames)}"
-        )
-
+def _ler_campos_de_sheet(sheet):
+    """Lê campos de qualquer aba de planilha, detectando cabeçalho e colunas automaticamente."""
     header_row = _detectar_linha_cabecalho(sheet)
     col_map = _mapear_colunas(sheet, header_row)
 
@@ -163,6 +150,24 @@ def _ler_xlsx_campos_entrada(filepath):
     return campos
 
 
+def _ler_xlsx_campos_entrada(filepath):
+    wb = openpyxl.load_workbook(filepath, data_only=True)
+
+    # Localiza a aba
+    sheet = None
+    for name in wb.sheetnames:
+        if _normalizar_chave(name) in ("camposentrada", "campos_entrada", "campos entrada"):
+            sheet = wb[name]
+            break
+    if sheet is None:
+        raise ValueError(
+            f"Aba 'Campos Entrada' não encontrada.\n"
+            f"Abas disponíveis: {', '.join(wb.sheetnames)}"
+        )
+
+    return _ler_campos_de_sheet(sheet)
+
+
 def _ler_csv_campos_entrada(filepath):
     campos = []
     with open(filepath, "r", encoding="utf-8-sig") as f:
@@ -198,15 +203,48 @@ def _ler_csv_campos_entrada(filepath):
     return campos
 
 
-def salvar_xlsx(filepath, campos):
-    """Salva lista de campos na aba 'Campos Entrada' do arquivo Excel."""
+def ler_todas_abas(filepath):
+    """
+    Lê todas as abas de um .xlsx como dicionário {nome_aba: [campos]}.
+    Para CSV, retorna uma única entrada 'Campos Entrada'.
+    Abas sem campos reconhecidos são ignoradas.
+    """
+    ext = os.path.splitext(filepath)[1].lower()
+
+    if ext == ".csv":
+        return {"Campos Entrada": _ler_csv_campos_entrada(filepath)}
+
+    wb = openpyxl.load_workbook(filepath, data_only=True)
+    resultado = {}
+
+    for nome_aba in wb.sheetnames:
+        ws = wb[nome_aba]
+        try:
+            campos = _ler_campos_de_sheet(ws)
+            if campos:
+                resultado[nome_aba] = campos
+        except Exception:
+            pass
+
+    return resultado
+
+
+def _nome_xml_para_aba(nome_aba):
+    """Converte nome de aba em identificador XML. Ex: 'Campos Entrada' → 'XML_ENTRADA'."""
+    n = re.sub(r"^[Cc]ampos\s+", "", nome_aba).strip()
+    n = re.sub(r"[\s_\-]+", "_", n).upper()
+    return f"XML_{n}"
+
+
+def salvar_xlsx(filepath, campos, nome_aba="Campos Entrada"):
+    """Salva lista de campos na aba indicada do arquivo Excel."""
     try:
         wb = openpyxl.load_workbook(filepath)
     except Exception:
         wb = openpyxl.Workbook()
-        wb.active.title = "Campos Entrada"
+        wb.active.title = nome_aba
 
-    sheet_name = "Campos Entrada"
+    sheet_name = nome_aba
     if sheet_name not in wb.sheetnames:
         ws = wb.create_sheet(sheet_name)
     else:
@@ -680,7 +718,9 @@ class GeradorXMLApp:
         self.root.configure(bg=COR_BG)
         self.root.minsize(900, 600)
 
-        self._campos: list = []             # campos da planilha principal
+        self._campos: list = []             # campos da aba ativa
+        self._dados_por_aba: dict = {}      # nome_aba → list of campos
+        self._aba_ativa: str = ""           # aba atualmente exibida
         self._origem: list = []             # campos da planilha origem
         self._arquivo_principal = None
         self._arquivo_origem = None
@@ -748,6 +788,18 @@ class GeradorXMLApp:
         self._lbl_principal = tk.Label(frp, text="—", bg=COR_TOOLBAR,
                                        fg="#555", font=("Segoe UI", 8))
         self._lbl_principal.pack(side=tk.LEFT, padx=6)
+
+        # ── Aba ativa ────────────────────────────────────────────────────────
+        fra_aba = tk.LabelFrame(bar, text="Aba", bg=COR_TOOLBAR,
+                                font=FONT_NORMAL, padx=4, pady=2)
+        fra_aba.pack(side=tk.LEFT, padx=4)
+
+        self._var_aba = tk.StringVar()
+        self._combo_aba = ttk.Combobox(fra_aba, textvariable=self._var_aba,
+                                       state="disabled", width=20, font=FONT_NORMAL)
+        self._combo_aba.pack(side=tk.LEFT, padx=2, pady=1)
+        self._combo_aba.bind("<<ComboboxSelected>>",
+                             lambda _: self._mudar_aba(self._var_aba.get()))
 
         # ── Planilha origem ──────────────────────────────────────────────────
         fro = tk.LabelFrame(bar, text="Planilha Origem", bg=COR_TOOLBAR,
@@ -954,12 +1006,28 @@ class GeradorXMLApp:
         if not path:
             return
         try:
-            self._campos = ler_campos_entrada(path)
+            self._dados_por_aba = ler_todas_abas(path)
+            if not self._dados_por_aba:
+                messagebox.showwarning("Aviso", "Nenhuma aba com campos detectados encontrada.")
+                return
+
             self._arquivo_principal = path
-            self._atualizar_tabela()
+
+            nomes = list(self._dados_por_aba.keys())
+            aba_padrao = next(
+                (n for n in nomes if _normalizar_chave(n) in ("camposentrada",)),
+                nomes[0]
+            )
+            self._combo_aba.configure(values=nomes, state="readonly")
+            self._var_aba.set(aba_padrao)
+            self._mudar_aba(aba_padrao)
+
             nome = os.path.basename(path)
             self._lbl_principal.config(text=nome, fg="#1565c0")
-            self._set_status(f"Principal carregada: {nome}  —  {len(self._campos)} campos")
+            total = sum(len(v) for v in self._dados_por_aba.values())
+            self._set_status(
+                f"Principal carregada: {nome}  —  {len(self._dados_por_aba)} aba(s), {total} campos"
+            )
         except Exception as e:
             messagebox.showerror("Erro ao carregar", str(e))
 
@@ -989,6 +1057,14 @@ class GeradorXMLApp:
         nome = os.path.basename(path)
         self._lbl_origem.config(text=nome, fg="#2e7d32")
         self._set_status(f"Origem carregada: {nome}  —  {len(campos)} campos disponíveis")
+
+    def _mudar_aba(self, nome_aba):
+        """Troca a aba ativa e atualiza a tabela de campos."""
+        self._aba_ativa = nome_aba
+        self._campos = self._dados_por_aba.get(nome_aba, [])
+        self._atualizar_tabela()
+        nome_xml = _nome_xml_para_aba(nome_aba)
+        self._set_status(f"Aba: {nome_aba}  ({len(self._campos)} campos)  →  {nome_xml}")
 
     def _ler_xlsx_generico(self, path):
         """Lê a primeira aba como lista de campos, usando a 1ª linha como cabeçalho."""
@@ -1216,7 +1292,7 @@ class GeradorXMLApp:
         try:
             ext = os.path.splitext(path)[1].lower()
             if ext in (".xlsx", ".xls"):
-                salvar_xlsx(path, self._campos)
+                salvar_xlsx(path, self._campos, self._aba_ativa or "Campos Entrada")
             else:
                 salvar_csv(path, self._campos)
             self._set_status(f"Planilha salva: {os.path.basename(path)}")
@@ -1299,7 +1375,9 @@ class GeradorXMLApp:
 
         sugerido = ""
         if self._arquivo_principal:
-            sugerido = os.path.splitext(self._arquivo_principal)[0] + ".xml"
+            nome_xml = _nome_xml_para_aba(self._aba_ativa) if self._aba_ativa else "XML"
+            dir_base = os.path.dirname(self._arquivo_principal)
+            sugerido = os.path.join(dir_base, nome_xml + ".xml")
 
         path = filedialog.asksaveasfilename(
             title="Salvar XML",
