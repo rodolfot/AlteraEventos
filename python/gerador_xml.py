@@ -20,7 +20,10 @@ import csv
 import os
 import re
 import threading
+import time
+import shutil
 import html
+from openpyxl.utils import get_column_letter
 import unicodedata
 
 
@@ -359,6 +362,97 @@ def salvar_csv(filepath, campos):
         writer.writerows(campos)
 
 
+def _to_cell_value(v):
+    """Converte string de _raw para o tipo adequado para escrita em célula xlsx."""
+    if v is None:
+        return None
+    s = str(v).strip()
+    if not s:
+        return None
+    try:
+        return int(s)
+    except (ValueError, TypeError):
+        pass
+    try:
+        return float(s)
+    except (ValueError, TypeError):
+        pass
+    return s
+
+
+def salvar_xlsx_estruturado(path_original, path_destino, dados_por_aba):
+    """
+    Persiste as alterações de dados_por_aba no xlsx preservando toda a estrutura original.
+
+    Estratégia:
+      1. Copia o arquivo original para path_destino (todos os tabs, formatação, imagens, etc.)
+      2. Para cada aba presente em dados_por_aba:
+           - Detecta a linha de cabeçalho e a primeira linha de dados no original
+           - Limpa apenas as células de dados (preserva linhas de título/seção acima)
+           - Reescreve todos os campos usando _raw (header original → número da coluna)
+           - PosicaoFinal é escrita como fórmula Excel (=PosIni+Tam-1)
+      3. Abas não presentes em dados_por_aba são intocadas.
+      4. O arquivo original NUNCA é modificado.
+    """
+    shutil.copy2(path_original, path_destino)
+    wb = openpyxl.load_workbook(path_destino)
+
+    for nome_aba, info in dados_por_aba.items():
+        if nome_aba not in wb.sheetnames:
+            continue
+
+        campos = info.get("campos", [])
+        ws = wb[nome_aba]
+
+        # ── Detectar cabeçalho ──────────────────────────────────────────────
+        header_row = _detectar_linha_cabecalho(ws)
+
+        # Mapa: header_name_original → col_number
+        col_map = {}
+        for cell in ws[header_row]:
+            if cell.value:
+                col_map[str(cell.value).strip()] = cell.column
+
+        if not col_map:
+            continue
+
+        # ── Detectar primeira linha de dados reais ──────────────────────────
+        # Percorre até 20 linhas após o cabeçalho procurando a primeira com dado
+        primeira_linha = header_row + 1
+        for r in range(header_row + 1, min(header_row + 21, ws.max_row + 1)):
+            if any(ws.cell(r, c).value is not None for c in col_map.values()):
+                primeira_linha = r
+                break
+
+        # ── Colunas especiais para fórmula PosicaoFinal ─────────────────────
+        col_posini = col_map.get("PosicaoInicial") or col_map.get("PosInicial")
+        col_tam    = col_map.get("TamanhoCampo")   or col_map.get("Tamanho")
+        col_posfin = col_map.get("PosicaoFinal")   or col_map.get("PosFinal")
+
+        # ── Limpar linhas de dados (só as colunas mapeadas) ─────────────────
+        for r in range(primeira_linha, ws.max_row + 1):
+            for col_num in col_map.values():
+                ws.cell(r, col_num).value = None
+
+        # ── Reescrever campos usando _raw ────────────────────────────────────
+        for i, campo in enumerate(campos):
+            r = primeira_linha + i
+            raw = campo.get("_raw", {})
+
+            for header_name, col_num in col_map.items():
+                # PosicaoFinal: fórmula Excel para manter a referência dinâmica
+                if (header_name in ("PosicaoFinal", "PosFinal")
+                        and col_posini and col_tam and col_posfin):
+                    letra_ini = get_column_letter(col_posini)
+                    letra_tam = get_column_letter(col_tam)
+                    ws.cell(r, col_num).value = f"={letra_ini}{r}+{letra_tam}{r}-1"
+                    continue
+
+                ws.cell(r, col_num).value = _to_cell_value(raw.get(header_name))
+
+    wb.save(path_destino)
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # XML
 # ─────────────────────────────────────────────────────────────────────────────
@@ -672,12 +766,22 @@ def construir_xml_persistencia(dados_por_aba, filepath=None):
     identificador = id_norm.get("identificador", "")
     if identificador:
         ET.SubElement(root_el, "Identificador").text = identificador
-    tamanho_layout = id_norm.get("tamanholayout", "")
+
+    # TamanhoLayout = PosicaoFinal do último campo de Campos Entrada
+    try:
+        tamanho_layout = str(max(
+            c["pos_fin"] for c in campos_entrada if c.get("pos_fin")
+        ))
+    except (ValueError, TypeError):
+        tamanho_layout = id_norm.get("tamanholayout", "")
     if tamanho_layout:
         ET.SubElement(root_el, "TamanhoLayout").text = tamanho_layout
     id_evento_val = id_norm.get("identificadorevento", "")
     if id_evento_val:
         ET.SubElement(root_el, "IdentificadorEvento").text = id_evento_val
+
+    # NomeTabela global: lida da aba "Identificação Evento" e aplicada a todos os campos
+    nome_tabela_global = id_norm.get("nometabela", "")
 
     campos_el = ET.SubElement(root_el, "Campos")
 
@@ -693,7 +797,10 @@ def construir_xml_persistencia(dados_por_aba, filepath=None):
                     ET.SubElement(item, tag).text = str(val)
                     return
 
-        _add("NomeTabela",       "NomeTabela")
+        # NomeTabela: valor global da aba Identificação Evento (igual para todos os campos)
+        nome_tab = nome_tabela_global or rn.get("nometabela", "")
+        if nome_tab:
+            ET.SubElement(item, "NomeTabela").text = nome_tab
         _add("NomeColuna",       "NomeColuna")
 
         # ValorPadrao apenas se não vazio
@@ -828,29 +935,51 @@ def construir_xml_enriquecimento(dados_por_aba):
       </DadoExterno>
     """
     def _find_campos(patts):
+        # Exact match first, then endswith — evita "Persistencia_enriquecimento"
+        # ser capturado antes de "Enriquecimento"
         for nome, info in dados_por_aba.items():
             n = _norm_aba(nome)
             for p in patts:
-                if n == p or n.endswith(p):
+                if n == p:
+                    return info.get("campos", [])
+        for nome, info in dados_por_aba.items():
+            n = _norm_aba(nome)
+            for p in patts:
+                if n.endswith(p):
                     return info.get("campos", [])
         return []
+
+    def _id_enr(rn):
+        """Normaliza IdentificadorEnriquecimento para string int (1.0 → '1')."""
+        v = rn.get("identificadorenriquecimento", "")
+        try:
+            return str(int(float(v)))
+        except (ValueError, TypeError):
+            return str(v).strip()
 
     enr_campos   = _find_campos(["enriquecimento"])
     chave_campos = _find_campos(["enrchaveacesso", "chaveacesso"])
     camp_campos  = _find_campos(["enrcamporetornado", "camporetornado"])
 
-    # Indexa por valor da coluna "Nome" (chave de ligação)
-    chaves_por_nome = {}
+    # TamanhoTransacao = PosicaoFinal do último campo de Campos Entrada
+    campos_entrada_enr = _aba_campos_entrada(dados_por_aba)
+    try:
+        tamanho_transacao = str(max(
+            c["pos_fin"] for c in campos_entrada_enr if c.get("pos_fin")
+        ))
+    except (ValueError, TypeError):
+        tamanho_transacao = ""
+
+    # Indexa por IdentificadorEnriquecimento (chave de ligação entre abas)
+    chaves_por_id = {}
     for c in chave_campos:
         rn = {_norm_aba(k): v for k, v in c.get("_raw", {}).items()}
-        nome = rn.get("nome", "") or c.get("nome", "")
-        chaves_por_nome.setdefault(nome, []).append(rn)
+        chaves_por_id.setdefault(_id_enr(rn), []).append(rn)
 
-    retornados_por_nome = {}
+    retornados_por_id = {}
     for c in camp_campos:
         rn = {_norm_aba(k): v for k, v in c.get("_raw", {}).items()}
-        nome = rn.get("nome", "") or c.get("nome", "")
-        retornados_por_nome.setdefault(nome, []).append(rn)
+        retornados_por_id.setdefault(_id_enr(rn), []).append(rn)
 
     root_el = ET.Element("DadoExterno")
     ET.SubElement(root_el, "Metrica", {"ligado": "S", "modo": "JMX"})
@@ -862,6 +991,7 @@ def construir_xml_enriquecimento(dados_por_aba):
     for c in enr_campos:
         rn   = {_norm_aba(k): v for k, v in c.get("_raw", {}).items()}
         nome = rn.get("nome", "") or c.get("nome", "")
+        enr_id = _id_enr(rn)
         da   = ET.SubElement(root_el, "DadoAcesso")
 
         # ComandoSQL — CDATA aplicado pós-geração
@@ -869,7 +999,7 @@ def construir_xml_enriquecimento(dados_por_aba):
 
         _te(da, "Nome",        nome)
         _te(da, "Descricao",   rn.get("descricao", "") or c.get("descricao", ""))
-        _te(da, "TamanhoTransacao", rn.get("tamanhotransacao", ""))
+        _te(da, "TamanhoTransacao", tamanho_transacao or rn.get("tamanhotransacao", ""))
         _te(da, "PersistirEnriquecimento",
             rn.get("persistirenriquecimento", "") or "S")
         _te(da, "PermiteAtualizarSeExistirCache",
@@ -880,9 +1010,9 @@ def construir_xml_enriquecimento(dados_por_aba):
         # SQLChave — CDATA aplicado pós-geração
         ET.SubElement(da, "SQLChave").text = rn.get("sqlchave", "")
 
-        # GrupoChave
+        # GrupoChave — ligação por IdentificadorEnriquecimento
         grupo = ET.SubElement(da, "GrupoChave")
-        for chave_n in chaves_por_nome.get(nome, []):
+        for chave_n in chaves_por_id.get(enr_id, []):
             chave_el = ET.SubElement(grupo, "ChaveAcesso")
             _te(chave_el, "Identificador",  chave_n.get("identificador", ""))
             _te(chave_el, "ConversorChave", chave_n.get("conversorchave", ""))
@@ -895,8 +1025,8 @@ def construir_xml_enriquecimento(dados_por_aba):
         _te(da, "PermiteAtualizarCache",
             rn.get("permiteatualizarcache", "") or "N")
 
-        # CampoRetornado
-        for cr_n in retornados_por_nome.get(nome, []):
+        # CampoRetornado — ligação por IdentificadorEnriquecimento
+        for cr_n in retornados_por_id.get(enr_id, []):
             cr = ET.SubElement(da, "CampoRetornado")
             _te(cr, "AliasCampo", cr_n.get("aliascampo", ""))
 
@@ -945,6 +1075,121 @@ def construir_xml_enriquecimento(dados_por_aba):
     pretty = _to_cdata(pretty, "ComandoSQL")
     pretty = _to_cdata(pretty, "SQLChave")
     return pretty
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Geração de Comandos SQL (ComandosSQL → ComandoSQL.sql)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def gerar_comandos_sql(dados_por_aba, filepath=None):
+    """
+    Gera scripts SQL para os campos com Persistência=S.
+
+    Estrutura do resultado:
+      1. Cabeçalhos fixos lidos da aba 'ComandosSQL' do xlsx (linhas onde
+         col1 != 'insert na tabela column_configuration')
+      2. Um INSERT INTO COLUMN_CONFIGURATION por campo com Persistência=S
+
+    Mapeamento TipoCampo → SQL type:
+      TEXTO          → VARCHAR2  (NR_DATA_LENGTH=tamanho, PRECISION=null, SCALE=null)
+      DATA / DATA_HORA → DATE    (all null)
+      INTEIRO / ID / FK / DECIMAL / NUMERO / NUMBER → NUMBER
+                                 (NR_DATA_LENGTH=null, PRECISION=tamanho, SCALE=null)
+      outros         → VARCHAR2  (default)
+    """
+    linhas_sql = []
+
+    # 1. Cabeçalhos fixos do xlsx ─────────────────────────────────────────────
+    if filepath:
+        try:
+            wb = openpyxl.load_workbook(filepath, data_only=True)
+            sheet = None
+            for name in wb.sheetnames:
+                if _norm_aba(name) == "comandossql":
+                    sheet = wb[name]
+                    break
+            if sheet is not None:
+                for row in sheet.iter_rows(min_row=1, values_only=True):
+                    label = str(row[0]).strip() if row[0] is not None else ""
+                    sql   = str(row[1]).strip() if len(row) > 1 and row[1] is not None else ""
+                    if label.lower() == "insert na tabela column_configuration":
+                        continue
+                    if sql:
+                        linhas_sql.append(sql)
+        except Exception:
+            pass
+
+    # 2. INSERTs por campo ────────────────────────────────────────────────────
+    # NomeTabela via aba "Identificação Evento"
+    id_evt = _ler_identificacao_evento(filepath) if filepath else {}
+    id_norm = {_norm_aba(k): v for k, v in id_evt.items()}
+    nome_tabela = id_norm.get("nometabela", "")
+
+    # Campos com Persistência=S
+    campos_entrada = _aba_campos_entrada(dados_por_aba)
+    campos_pers = [
+        c for c in campos_entrada
+        if _raw_flag(c.get("_raw", {}), "Persistência", "Persistencia")
+    ]
+
+    _TIPO_NUMBER = {"inteiro", "id", "fk", "decimal", "numero", "number"}
+    _TIPO_DATE   = {"data", "data_hora"}
+
+    for c in campos_pers:
+        raw  = c.get("_raw", {})
+        rn   = {_norm_aba(k): v for k, v in raw.items()}
+
+        nome_coluna  = (rn.get("nomecampo") or c.get("nome") or "").strip()
+        descricao    = (rn.get("descricaocampo") or rn.get("descricao") or "").strip()
+        # Escapar aspas simples na descrição
+        descricao    = descricao.replace("'", "''")
+
+        tipo_campo   = (rn.get("tipocampo") or rn.get("tipo") or "").strip().lower()
+        tamanho_raw  = rn.get("tamanho") or c.get("tamanho") or ""
+        try:
+            tamanho = int(float(str(tamanho_raw)))
+        except (ValueError, TypeError):
+            tamanho = 0
+
+        nullable_raw = (rn.get("obrigatorio") or rn.get("nullable") or "N").strip().upper()
+        # IN_NULLABLE: se obrigatório=S → 0, se não → 1
+        in_nullable  = 0 if nullable_raw == "S" else 1
+
+        if tipo_campo in _TIPO_DATE:
+            sql_type          = "DATE"
+            nr_data_length    = "null"
+            nr_data_precision = "null"
+            nr_data_scale     = "null"
+        elif tipo_campo in _TIPO_NUMBER:
+            sql_type          = "NUMBER"
+            nr_data_length    = "null"
+            nr_data_precision = str(tamanho) if tamanho else "null"
+            nr_data_scale     = "null"
+        else:
+            # VARCHAR2 (TEXTO e demais)
+            sql_type          = "VARCHAR2"
+            nr_data_length    = str(tamanho) if tamanho else "null"
+            nr_data_precision = "null"
+            nr_data_scale     = "null"
+
+        insert = (
+            f"insert into COLUMN_CONFIGURATION "
+            f"(ID_COLUMN_CONFIGURATION,ID_TABLE_CONFIGURATION,ID_DATA_TYPE,"
+            f"NM_COLUMN_CONFIGURATION,DS_COLUMN_CONFIGURATION,"
+            f"NR_DATA_LENGTH,NR_DATA_PRECISION,NR_DATA_SCALE,IN_NULLABLE,"
+            f"IN_PK,IN_FK) values (\n"
+            f"  seq_COLUMN_CONFIGURATION.nextval,\n"
+            f"  (select ID_TABLE_CONFIGURATION from TABLE_CONFIGURATION "
+            f"where NM_TABLE_CONFIGURATION='{nome_tabela}'),\n"
+            f"  (select ID_DATA_TYPE from DATA_TYPE "
+            f"where NM_DATA_TYPE='{sql_type}'),\n"
+            f"  '{nome_coluna}','{descricao}',"
+            f"{nr_data_length},{nr_data_precision},{nr_data_scale},"
+            f"{in_nullable},0,0);"
+        )
+        linhas_sql.append(insert)
+
+    return "\n\n".join(linhas_sql)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1028,18 +1273,35 @@ class JanelaCarregando(tk.Toplevel):
         self.transient(parent)
         self.protocol("WM_DELETE_WINDOW", lambda: None)  # impede fechar
 
+        self._evento_cancel = threading.Event()
+
         frm = tk.Frame(self, bg=COR_BG, padx=40, pady=28)
         frm.pack(fill=tk.BOTH, expand=True)
 
         tk.Label(frm, text="⏳", bg=COR_BG, font=("Segoe UI", 32)).pack()
-        tk.Label(
+        self._lbl_msg = tk.Label(
             frm, text=mensagem, bg=COR_BG,
-            font=FONT_BOLD, fg="#333333", wraplength=300
-        ).pack(pady=(10, 14))
+            font=FONT_BOLD, fg="#333333", wraplength=300, justify=tk.CENTER
+        )
+        self._lbl_msg.pack(pady=(10, 10))
 
         self._bar = ttk.Progressbar(frm, mode="indeterminate", length=280)
         self._bar.pack()
         self._bar.start(12)
+
+        self._lbl_timer = tk.Label(
+            frm, text="00:00", bg=COR_BG,
+            font=("Segoe UI", 10), fg="#888888"
+        )
+        self._lbl_timer.pack(pady=(8, 6))
+
+        tk.Button(
+            frm, text="✕  Cancelar",
+            command=self._solicitar_cancelamento,
+            bg="#c62828", fg="white",
+            font=FONT_NORMAL, relief=tk.FLAT,
+            padx=14, pady=5, cursor="hand2"
+        ).pack()
 
         # Centraliza sobre o parent
         self.update_idletasks()
@@ -1049,8 +1311,42 @@ class JanelaCarregando(tk.Toplevel):
 
         self.grab_set()
 
+        self._inicio = time.time()
+        self._timer_id = None
+        self._tick()
+
+    def _tick(self):
+        try:
+            elapsed = int(time.time() - self._inicio)
+            mins, secs = divmod(elapsed, 60)
+            self._lbl_timer.config(text=f"{mins:02d}:{secs:02d}")
+            self._timer_id = self.after(1000, self._tick)
+        except Exception:
+            pass
+
+    def _solicitar_cancelamento(self):
+        self._evento_cancel.set()
+        try:
+            self._lbl_msg.config(text="Cancelando...\nAguarde o passo atual finalizar.")
+        except Exception:
+            pass
+
+    @property
+    def cancelado(self):
+        return self._evento_cancel.is_set()
+
+    def atualizar(self, msg):
+        """Atualiza a mensagem exibida durante o loading."""
+        try:
+            self._lbl_msg.config(text=msg)
+            self.update_idletasks()
+        except Exception:
+            pass
+
     def fechar(self):
         try:
+            if self._timer_id:
+                self.after_cancel(self._timer_id)
             self._bar.stop()
             self.grab_release()
             self.destroy()
@@ -1401,6 +1697,8 @@ class GeradorXMLApp:
         self._dados_por_aba_origem: dict = {}  # nome_aba → {"campos": list, "headers": list, "sections": dict}
         self._arquivo_principal = None
         self._arquivo_origem = None
+        self._path_principal_pendente = None   # selecionado mas ainda não carregado
+        self._path_origem_pendente    = None
         self._idx_editando = -1             # índice do campo sendo editado
 
         # Widgets do notebook de abas (criados em _build_tabela)
@@ -1437,8 +1735,9 @@ class GeradorXMLApp:
         self.root.config(menu=mb)
 
         m_arq = tk.Menu(mb, tearoff=0)
-        m_arq.add_command(label="Carregar Principal...  Ctrl+O", command=self.carregar_principal)
-        m_arq.add_command(label="Carregar Origem...",             command=self.carregar_origem)
+        m_arq.add_command(label="Selecionar Principal...  Ctrl+O", command=self.selecionar_principal)
+        m_arq.add_command(label="Selecionar Origem...",            command=self.selecionar_origem)
+        m_arq.add_command(label="Carregar Planilhas",              command=self.carregar_planilhas)
         m_arq.add_separator()
         m_arq.add_command(label="Salvar Planilha  Ctrl+S",        command=self.salvar_planilha)
         m_arq.add_separator()
@@ -1470,7 +1769,7 @@ class GeradorXMLApp:
                             font=FONT_NORMAL, padx=4, pady=2)
         frp.pack(side=tk.LEFT, padx=8)
 
-        self._btn(frp, "📂 Carregar Principal", self.carregar_principal,
+        self._btn(frp, "📂 Selecionar Principal", self.selecionar_principal,
                   COR_BTN_VERDE, side=tk.LEFT, padx=2)
         self._lbl_principal = tk.Label(frp, text="—", bg=COR_TOOLBAR,
                                        fg="#555", font=("Segoe UI", 8))
@@ -1481,11 +1780,20 @@ class GeradorXMLApp:
                             font=FONT_NORMAL, padx=4, pady=2)
         fro.pack(side=tk.LEFT, padx=4)
 
-        self._btn(fro, "📂 Carregar Origem", self.carregar_origem,
+        self._btn(fro, "📂 Selecionar Origem", self.selecionar_origem,
                   COR_BTN_AZUL, side=tk.LEFT, padx=2)
         self._lbl_origem = tk.Label(fro, text="—", bg=COR_TOOLBAR,
                                     fg="#555", font=("Segoe UI", 8))
         self._lbl_origem.pack(side=tk.LEFT, padx=6)
+
+        # ── Carregar (dispara o loading de todas as planilhas selecionadas) ──
+        frl = tk.Frame(bar, bg=COR_TOOLBAR)
+        frl.pack(side=tk.LEFT, padx=6)
+        self._btn_carregar = self._btn(
+            frl, "⬇ Carregar Planilhas", self.carregar_planilhas,
+            COR_BTN_VERDE, side=tk.LEFT, padx=2
+        )
+        self._btn_carregar.configure(state=tk.DISABLED)
 
         # ── Copiar campos ─────────────────────────────────────────────────────
         frc = tk.LabelFrame(bar, text="Copiar Campos da Origem", bg=COR_TOOLBAR,
@@ -1567,6 +1875,7 @@ class GeradorXMLApp:
             ("LayoutPersistencia", "  LayoutPersistencia  "),
             ("mapaAtributo",       "  mapaAtributo  "),
             ("DadoExterno",        "  DadoExterno  "),
+            ("ComandoSQL",         "  ComandoSQL  "),
         ]
         for key, label in _XML_ABAS:
             frx = tk.Frame(nb, bg=COR_BG, padx=4, pady=4)
@@ -1600,8 +1909,7 @@ class GeradorXMLApp:
 
     def _build_xml_tab(self, parent, key):
         """Cria aba de preview XML com botão de atualização. Retorna o widget Text."""
-        btn_label = "🔄 Atualizar Preview [F7]" if key == "LayoutEntrada" else "🔄 Atualizar Preview"
-        self._btn(parent, btn_label, lambda k=key: self._preview_xml_tab(k),
+        self._btn(parent, "🔄 Atualizar Preview", self._preview_todas_abas,
                   COR_BTN_ROXO, anchor=tk.NW, pady=(0, 6))
 
         frm = tk.Frame(parent)
@@ -1642,7 +1950,7 @@ class GeradorXMLApp:
     # ── Atalhos ──────────────────────────────────────────────────────────────
 
     def _bind_atalhos(self):
-        self.root.bind("<Control-o>", lambda _: self.carregar_principal())
+        self.root.bind("<Control-o>", lambda _: self.selecionar_principal())
         self.root.bind("<Control-s>", lambda _: self.salvar_planilha())
         self.root.bind("<F5>",        lambda _: self.validar())
         self.root.bind("<F6>",        lambda _: self.gerar_xml())
@@ -1674,79 +1982,143 @@ class GeradorXMLApp:
 
         threading.Thread(target=_runner, daemon=True).start()
 
-    def carregar_principal(self):
+    def selecionar_principal(self):
+        """Abre diálogo de seleção — apenas armazena o caminho, não carrega ainda."""
         path = filedialog.askopenfilename(
-            title="Carregar Planilha Principal",
+            title="Selecionar Planilha Principal",
             filetypes=[("Excel/CSV", "*.xlsx *.xls *.csv"), ("Todos", "*.*")]
         )
         if not path:
             return
+        self._path_principal_pendente = path
+        nome = os.path.basename(path)
+        self._lbl_principal.config(text=f"● {nome}", fg="#e65100")
+        self._btn_carregar.configure(state=tk.NORMAL)
+        self._set_status(f"Principal selecionada: {nome}  —  clique em 'Carregar Planilhas' para carregar.")
 
-        def _tarefa():
-            return ler_todas_abas(path)
+    def selecionar_origem(self):
+        """Abre diálogo de seleção — apenas armazena o caminho, não carrega ainda."""
+        path = filedialog.askopenfilename(
+            title="Selecionar Planilha Origem",
+            filetypes=[("Excel/CSV", "*.xlsx *.xls *.csv"), ("Todos", "*.*")]
+        )
+        if not path:
+            return
+        self._path_origem_pendente = path
+        nome = os.path.basename(path)
+        self._lbl_origem.config(text=f"● {nome}", fg="#e65100")
+        self._btn_carregar.configure(state=tk.NORMAL)
+        self._set_status(f"Origem selecionada: {nome}  —  clique em 'Carregar Planilhas' para carregar.")
 
-        def _sucesso(dados):
-            if not dados:
-                messagebox.showwarning("Aviso", "Nenhuma aba com campos detectados encontrada.")
+    def _aplicar_principal(self, path, dados):
+        """Aplica os dados da planilha principal já carregados na UI."""
+        self._dados_por_aba = dados
+        self._arquivo_principal = path
+        nomes = list(dados.keys())
+        aba_padrao = next(
+            (n for n in nomes if _normalizar_chave(n) in ("camposentrada",)),
+            nomes[0]
+        )
+        self._reconstruir_abas_principal(dados, aba_padrao)
+        nome = os.path.basename(path)
+        self._lbl_principal.config(text=nome, fg="#1565c0")
+        total = sum(len(v["campos"]) for v in dados.values())
+        self._set_status(f"Principal carregada: {nome}  —  {len(dados)} aba(s), {total} campos")
+
+    def _aplicar_origem(self, path, dados):
+        """Aplica os dados da planilha origem já carregados na UI."""
+        self._dados_por_aba_origem = dados
+        self._arquivo_origem = path
+        self._btn_copiar_origem.configure(state=tk.NORMAL)
+        nome = os.path.basename(path)
+        self._lbl_origem.config(text=nome, fg="#2e7d32")
+        total = sum(len(v["campos"]) for v in dados.values())
+        self._set_status(
+            f"Origem carregada: {nome}  —  {len(dados)} aba(s), {total} campos disponíveis"
+        )
+
+    def carregar_planilhas(self):
+        """Carrega em sequência todas as planilhas com seleção pendente."""
+        arquivos = []
+        if self._path_principal_pendente:
+            arquivos.append(("principal", self._path_principal_pendente))
+        if self._path_origem_pendente:
+            arquivos.append(("origem", self._path_origem_pendente))
+
+        if not arquivos:
+            messagebox.showwarning("Aviso", "Selecione pelo menos uma planilha antes de carregar.")
+            return
+
+        total = len(arquivos)
+        janela = JanelaCarregando(self.root, "Preparando...")
+
+        def _runner():
+            resultados = {}
+            erro_info  = None
+            for i, (tipo, path) in enumerate(arquivos):
+                if janela.cancelado:
+                    break
+                nome = os.path.basename(path)
+                msg  = f"Carregando:\n{nome}\n\narquivo {i + 1} de {total}"
+                self.root.after(0, lambda m=msg: janela.atualizar(m))
+                try:
+                    dados = ler_todas_abas(path)
+                    if tipo == "origem" and not dados:
+                        campos = self._ler_xlsx_generico(path)
+                        nome_fb = os.path.splitext(os.path.basename(path))[0]
+                        dados = {nome_fb: {"campos": campos, "headers": []}}
+                    resultados[tipo] = (path, dados)
+                except Exception as e:
+                    erro_info = (tipo, path, e)
+                    break
+            cancelado = janela.cancelado
+            self.root.after(0, lambda: _finalizar(resultados, erro_info, cancelado))
+
+        def _finalizar(resultados, erro, cancelado):
+            janela.fechar()
+
+            if cancelado:
+                # Rollback: nenhum dado é aplicado — estado anterior preservado
+                self._set_status("Carregamento cancelado — nenhuma alteração aplicada.")
                 return
 
-            self._dados_por_aba = dados
-            self._arquivo_principal = path
+            if erro:
+                tipo, path, exc = erro
+                messagebox.showerror(
+                    "Erro ao carregar",
+                    f"{os.path.basename(path)}:\n{exc}"
+                )
 
-            nomes = list(dados.keys())
-            aba_padrao = next(
-                (n for n in nomes if _normalizar_chave(n) in ("camposentrada",)),
-                nomes[0]
-            )
+            if "principal" in resultados:
+                path, dados = resultados["principal"]
+                if not dados:
+                    messagebox.showwarning(
+                        "Aviso",
+                        f"{os.path.basename(path)}: nenhuma aba com campos detectada."
+                    )
+                else:
+                    self._aplicar_principal(path, dados)
+                    self._path_principal_pendente = None
 
-            self._reconstruir_abas_principal(dados, aba_padrao)
+            if "origem" in resultados:
+                path, dados = resultados["origem"]
+                self._aplicar_origem(path, dados)
+                self._path_origem_pendente = None
 
-            nome = os.path.basename(path)
-            self._lbl_principal.config(text=nome, fg="#1565c0")
-            total = sum(len(v["campos"]) for v in dados.values())
-            self._set_status(
-                f"Principal carregada: {nome}  —  {len(dados)} aba(s), {total} campos"
-            )
+            # Desabilita "Carregar" se não há mais nada pendente
+            if not self._path_principal_pendente and not self._path_origem_pendente:
+                self._btn_carregar.configure(state=tk.DISABLED)
 
-        def _erro(e):
-            messagebox.showerror("Erro ao carregar", str(e))
+            # Mensagem final consolidada na status bar
+            partes = []
+            if "principal" in resultados and resultados["principal"][1]:
+                partes.append(f"Principal: {os.path.basename(resultados['principal'][0])}")
+            if "origem" in resultados:
+                partes.append(f"Origem: {os.path.basename(resultados['origem'][0])}")
+            if partes:
+                self._set_status("Carregadas — " + "  |  ".join(partes))
 
-        self._executar_em_thread(_tarefa, _sucesso, _erro, "Carregando planilha principal...")
-
-    def carregar_origem(self):
-        path = filedialog.askopenfilename(
-            title="Carregar Planilha Origem",
-            filetypes=[("Excel/CSV", "*.xlsx *.xls *.csv"), ("Todos", "*.*")]
-        )
-        if not path:
-            return
-
-        def _tarefa():
-            dados = ler_todas_abas(path)
-            if not dados:
-                # Fallback: lê a primeira aba genericamente
-                campos = self._ler_xlsx_generico(path)
-                nome_fallback = os.path.splitext(os.path.basename(path))[0]
-                dados = {nome_fallback: {"campos": campos, "headers": []}}
-            return dados
-
-        def _sucesso(dados):
-            self._dados_por_aba_origem = dados
-            self._arquivo_origem = path
-            self._btn_copiar_origem.configure(state=tk.NORMAL)
-
-            nome = os.path.basename(path)
-            self._lbl_origem.config(text=nome, fg="#2e7d32")
-            n_abas = len(dados)
-            total = sum(len(v["campos"]) for v in dados.values())
-            self._set_status(
-                f"Origem carregada: {nome}  —  {n_abas} aba(s), {total} campos disponíveis"
-            )
-
-        def _erro(e):
-            messagebox.showerror("Erro ao carregar origem", str(e))
-
-        self._executar_em_thread(_tarefa, _sucesso, _erro, "Carregando planilha origem...")
+        threading.Thread(target=_runner, daemon=True).start()
 
     # ── Abas estilo Excel (notebook) ──────────────────────────────────────────
 
@@ -1890,17 +2262,108 @@ class GeradorXMLApp:
                 else:
                     novos.append(orig)
 
-            # Adiciona campos novos sequencialmente
+            # ── Índices de dados específicos da origem (por NomeCampo normalizado) ─
+            pers_idx = {}   # abas "Persistenc*"
+            mapa_idx = {}   # abas "RuleAttribute*" ou "MapaAtributo*"
+            for nome_aba, info in self._dados_por_aba_origem.items():
+                n_aba = _norm_aba(nome_aba)
+                for idx, patts in [(pers_idx, ("persistenc",)),
+                                   (mapa_idx, ("ruleattribute", "mapaatributo", "attributemap"))]:
+                    if any(n_aba.startswith(p) for p in patts):
+                        for c in info.get("campos", []):
+                            raw_p = c.get("_raw", {})
+                            rn_p  = {_norm_aba(k): v for k, v in raw_p.items()}
+                            nc = rn_p.get("nomecampo", "") or c.get("nome", "")
+                            if nc:
+                                idx.setdefault(_norm_aba(nc), raw_p)
+                        break
+
+            # ── NomeTabela do arquivo principal ───────────────────────────────────
+            id_evt_principal = (
+                _ler_identificacao_evento(self._arquivo_principal)
+                if self._arquivo_principal else {}
+            )
+            id_norm_principal = {_norm_aba(k): v for k, v in id_evt_principal.items()}
+            nome_tabela_principal = id_norm_principal.get("nometabela", "")
+
+            # ── Helpers ──────────────────────────────────────────────────────────
+            def _id_reservado(v):
+                return (1000 <= v < 2000) or (20000 <= v <= 21000)
+
+            def _set_raw(raw, val, std_key, *norm_alts):
+                for k in list(raw.keys()):
+                    if _norm_aba(k) in norm_alts:
+                        raw[k] = str(val)
+                        return
+                raw[std_key] = str(val)
+
+            _SKIP_MERGE = {
+                "persistencia", "persistência",
+                "mapaatributo",
+                "posicaoinicial", "posinicial",
+                "posicaofinal", "posfinal",
+                "identificadorcampo",
+            }
+
+            def _mesclar_persistencia(raw, nome_campo):
+                """Mescla dados de persistência da origem e força NomeTabela principal."""
+                pers_raw = pers_idx.get(_norm_aba(nome_campo), {})
+                for k, v in pers_raw.items():
+                    if _norm_aba(k) not in _SKIP_MERGE:
+                        raw.setdefault(k, v)
+                # NomeTabela sempre vem do arquivo principal
+                if nome_tabela_principal:
+                    _set_raw(raw, nome_tabela_principal, "NomeTabela", "nometabela")
+
+            def _mesclar_mapa(raw, nome_campo):
+                """Mescla dados de mapa de atributo da origem."""
+                mapa_raw = mapa_idx.get(_norm_aba(nome_campo), {})
+                for k, v in mapa_raw.items():
+                    if _norm_aba(k) not in _SKIP_MERGE:
+                        raw.setdefault(k, v)
+
+            # ── Próximo IdentificadorCampo sequencial ─────────────────────────────
+            used_ids = []
+            for c in self._campos:
+                try:
+                    v = int(float(c.get("id", "")))
+                    if not _id_reservado(v):
+                        used_ids.append(v)
+                except (ValueError, TypeError):
+                    pass
+            next_id = (max(used_ids) + 1) if used_ids else 1
+
+            # ── Adiciona campos novos ─────────────────────────────────────────────
             for orig in novos:
-                novo = dict(orig)
+                novo      = dict(orig)
+                novo["_raw"] = dict(orig.get("_raw", {}))
+                raw       = novo["_raw"]
+
+                # Se Persistência=S, mescla dados do tab de persistência da origem
+                if _raw_flag(raw, "Persistência", "Persistencia"):
+                    _mesclar_persistencia(raw, novo.get("nome", ""))
+                # Se MapaAtributo=S, mescla dados de mapa de atributo da origem
+                if _raw_flag(raw, "MapaAtributo"):
+                    _mesclar_mapa(raw, novo.get("nome", ""))
+
+                # Posição sequencial da planilha principal
                 ativos = [c for c in self._campos if c.get("pos_ini") and c.get("tamanho")]
-                prox = (max(c["pos_ini"] + c["tamanho"] for c in ativos) if ativos else 1)
+                prox   = (max(c["pos_ini"] + c["tamanho"] for c in ativos) if ativos else 1)
                 novo["pos_ini"] = prox
                 if novo.get("tamanho"):
                     novo["pos_fin"] = prox + novo["tamanho"] - 1
-                self._campos.append(novo)
+                _set_raw(raw, prox, "PosicaoInicial", "posicaoinicial", "posinicial")
+                if novo.get("pos_fin"):
+                    _set_raw(raw, novo["pos_fin"], "PosicaoFinal", "posicaofinal", "posfinal")
 
-            # Pergunta sobre duplicatas de uma vez só
+                # IdentificadorCampo sequencial da planilha principal
+                novo["id"] = str(next_id)
+                _set_raw(raw, next_id, "IdentificadorCampo", "identificadorcampo")
+
+                self._campos.append(novo)
+                next_id += 1
+
+            # ── Duplicatas ────────────────────────────────────────────────────────
             atualizados = 0
             if duplicatas:
                 nomes_dup = "\n".join(f"  • {e.get('nome')}" for e, _ in duplicatas)
@@ -1914,6 +2377,12 @@ class GeradorXMLApp:
                                 existente[key] = orig[key]
                         if not existente.get("valor"):
                             existente["valor"] = orig.get("valor_padrao", "")
+                        # Atualiza também dados de persistência, mapa de atributo e NomeTabela
+                        raw_ex = existente.setdefault("_raw", {})
+                        if _raw_flag(raw_ex, "Persistência", "Persistencia"):
+                            _mesclar_persistencia(raw_ex, existente.get("nome", ""))
+                        if _raw_flag(raw_ex, "MapaAtributo"):
+                            _mesclar_mapa(raw_ex, existente.get("nome", ""))
                         atualizados += 1
 
             self._atualizar_tabela()
@@ -2059,8 +2528,14 @@ class GeradorXMLApp:
             messagebox.showwarning("Aviso", "Nenhum campo para salvar.")
             return
 
-        path = self._arquivo_principal
-        if not path:
+        if self._arquivo_principal:
+            # Sempre salva em uma cópia _Novo, preservando o original
+            base, ext = os.path.splitext(self._arquivo_principal)
+            # Remove sufixo _Novo anterior para não empilhar (ex: Arq_Novo_Novo)
+            if base.endswith("_Novo"):
+                base = base[:-5]
+            path = base + "_Novo" + ext
+        else:
             path = filedialog.asksaveasfilename(
                 title="Salvar Planilha",
                 defaultextension=".xlsx",
@@ -2068,12 +2543,18 @@ class GeradorXMLApp:
             )
             if not path:
                 return
-            self._arquivo_principal = path
 
         try:
             ext = os.path.splitext(path)[1].lower()
             if ext in (".xlsx", ".xls"):
-                salvar_xlsx(path, self._campos, self._aba_ativa or "Campos Entrada")
+                if self._arquivo_principal and self._dados_por_aba:
+                    # Salva preservando toda a estrutura original (todos os tabs, formatação)
+                    salvar_xlsx_estruturado(
+                        self._arquivo_principal, path, self._dados_por_aba
+                    )
+                else:
+                    # Fallback: sem arquivo original, cria planilha simples
+                    salvar_xlsx(path, self._campos, self._aba_ativa or "Campos Entrada")
             else:
                 salvar_csv(path, self._campos)
             self._set_status(f"Planilha salva: {os.path.basename(path)}")
@@ -2130,7 +2611,7 @@ class GeradorXMLApp:
     # ── XML ───────────────────────────────────────────────────────────────────
 
     # Índice de cada aba XML dentro do notebook (tab 0 = Validação)
-    _XML_TAB_KEYS = ["LayoutEntrada", "LayoutPersistencia", "mapaAtributo", "DadoExterno"]
+    _XML_TAB_KEYS = ["LayoutEntrada", "LayoutPersistencia", "mapaAtributo", "DadoExterno", "ComandoSQL"]
 
     def _atualizar_tab_xml(self, key, xml_str):
         """Popula a aba de XML preview correspondente sem trocar de aba."""
@@ -2142,48 +2623,91 @@ class GeradorXMLApp:
         txt.insert(tk.END, xml_str)
         txt.configure(state=tk.DISABLED)
 
+    def _gerar_xml_str(self, key):
+        """Gera e retorna o conteúdo (XML ou SQL) para a aba indicada."""
+        if key == "LayoutEntrada":
+            aba_e = None
+            for nome, info in self._dados_por_aba.items():
+                if _norm_aba(nome) == "camposentrada":
+                    aba_e = info
+                    break
+            if aba_e is None and self._dados_por_aba:
+                aba_e = next(iter(self._dados_por_aba.values()))
+            return construir_xml(
+                aba_e.get("campos", [])   if aba_e else self._campos,
+                aba_e.get("headers", [])  if aba_e else self._headers_ativos,
+                "Campos Entrada",
+                aba_e.get("sections", {}) if aba_e else self._sections_ativos,
+            )
+        elif key == "LayoutPersistencia":
+            return construir_xml_persistencia(
+                self._dados_por_aba, self._arquivo_principal
+            )
+        elif key == "mapaAtributo":
+            return construir_xml_mapa_atributo(
+                self._dados_por_aba, self._arquivo_principal
+            )
+        elif key == "DadoExterno":
+            return construir_xml_enriquecimento(self._dados_por_aba)
+        elif key == "ComandoSQL":
+            return gerar_comandos_sql(self._dados_por_aba, self._arquivo_principal)
+        return None
+
     def _preview_xml_tab(self, key):
-        """Gera e exibe o XML correspondente à chave, selecionando a aba correta."""
+        """Gera e exibe o conteúdo de uma aba, selecionando-a no notebook."""
         if not self._dados_por_aba:
             messagebox.showwarning("Aviso", "Carregue uma planilha primeiro.")
             return
         try:
-            if key == "LayoutEntrada":
-                aba_e = None
-                for nome, info in self._dados_por_aba.items():
-                    if _norm_aba(nome) == "camposentrada":
-                        aba_e = info
-                        break
-                if aba_e is None and self._dados_por_aba:
-                    aba_e = next(iter(self._dados_por_aba.values()))
-                xml_str = construir_xml(
-                    aba_e.get("campos", [])   if aba_e else self._campos,
-                    aba_e.get("headers", [])  if aba_e else self._headers_ativos,
-                    "Campos Entrada",
-                    aba_e.get("sections", {}) if aba_e else self._sections_ativos,
-                )
-            elif key == "LayoutPersistencia":
-                xml_str = construir_xml_persistencia(
-                    self._dados_por_aba, self._arquivo_principal
-                )
-            elif key == "mapaAtributo":
-                xml_str = construir_xml_mapa_atributo(
-                    self._dados_por_aba, self._arquivo_principal
-                )
-            elif key == "DadoExterno":
-                xml_str = construir_xml_enriquecimento(self._dados_por_aba)
-            else:
+            xml_str = self._gerar_xml_str(key)
+            if xml_str is None:
                 return
-
             self._atualizar_tab_xml(key, xml_str)
-            # Seleciona a aba correta (tab 0 = Validação, tab 1+ = XMLs)
             self._notebook.select(1 + self._XML_TAB_KEYS.index(key))
         except Exception as e:
             messagebox.showerror(f"Erro ao gerar {key}", str(e))
 
+    def _preview_todas_abas(self):
+        """Atualiza o conteúdo de todas as abas de preview em thread separada."""
+        if not self._dados_por_aba:
+            messagebox.showwarning("Aviso", "Carregue uma planilha primeiro.")
+            return
+
+        total = len(self._XML_TAB_KEYS)
+        janela = JanelaCarregando(self.root, "Gerando previews...")
+
+        def _runner():
+            resultados = {}
+            erros = []
+            for i, key in enumerate(self._XML_TAB_KEYS):
+                if janela.cancelado:
+                    break
+                msg = f"Gerando preview:\n{key}\n\n{i + 1} de {total}"
+                self.root.after(0, lambda m=msg: janela.atualizar(m))
+                try:
+                    resultados[key] = self._gerar_xml_str(key)
+                except Exception as e:
+                    erros.append(f"{key}: {e}")
+            cancelado = janela.cancelado
+            self.root.after(0, lambda: _finalizar(resultados, erros, cancelado))
+
+        def _finalizar(resultados, erros, cancelado):
+            janela.fechar()
+            if cancelado:
+                # Rollback: nenhuma aba é atualizada — conteúdo anterior preservado
+                self._set_status("Preview cancelado — conteúdo anterior preservado.")
+                return
+            for key, xml_str in resultados.items():
+                if xml_str is not None:
+                    self._atualizar_tab_xml(key, xml_str)
+            if erros:
+                messagebox.showerror("Erro ao atualizar preview", "\n".join(erros))
+
+        threading.Thread(target=_runner, daemon=True).start()
+
     def preview_xml(self):
-        """Atalho F7: gera e exibe o LayoutEntrada."""
-        self._preview_xml_tab("LayoutEntrada")
+        """Atalho F7: atualiza todas as abas de preview."""
+        self._preview_todas_abas()
 
     def gerar_xml(self):
         if not self._dados_por_aba:
@@ -2271,6 +2795,17 @@ class GeradorXMLApp:
             self._atualizar_tab_xml("DadoExterno", xml_str)
         except Exception as e:
             erros_geracao.append(f"DadoExterno.xml: {e}")
+
+        # 5. ComandoSQL.sql
+        try:
+            sql_str = gerar_comandos_sql(self._dados_por_aba, self._arquivo_principal)
+            path = os.path.join(dir_saida, "ComandoSQL.sql")
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(sql_str)
+            gerados.append("ComandoSQL.sql")
+            self._atualizar_tab_xml("ComandoSQL", sql_str)
+        except Exception as e:
+            erros_geracao.append(f"ComandoSQL.sql: {e}")
 
         # Resultado
         linhas_ok  = "\n".join(f"  ✔ {n}" for n in gerados)
