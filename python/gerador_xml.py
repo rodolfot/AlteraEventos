@@ -2253,6 +2253,7 @@ class GeradorXMLApp:
             if not campos_selecionados:
                 return
 
+            # ── Separar novos × duplicatas (rápido, main thread) ─────────────────
             novos, duplicatas = [], []
             for orig in campos_selecionados:
                 nome = orig.get("nome", "")
@@ -2262,114 +2263,131 @@ class GeradorXMLApp:
                 else:
                     novos.append(orig)
 
-            # ── Índices de dados específicos da origem (por NomeCampo normalizado) ─
-            pers_idx = {}   # abas "Persistenc*"
-            mapa_idx = {}   # abas "RuleAttribute*" ou "MapaAtributo*"
-            for nome_aba, info in self._dados_por_aba_origem.items():
-                n_aba = _norm_aba(nome_aba)
-                for idx, patts in [(pers_idx, ("persistenc",)),
-                                   (mapa_idx, ("ruleattribute", "mapaatributo", "attributemap"))]:
-                    if any(n_aba.startswith(p) for p in patts):
-                        for c in info.get("campos", []):
-                            raw_p = c.get("_raw", {})
-                            rn_p  = {_norm_aba(k): v for k, v in raw_p.items()}
-                            nc = rn_p.get("nomecampo", "") or c.get("nome", "")
-                            if nc:
-                                idx.setdefault(_norm_aba(nc), raw_p)
-                        break
-
-            # ── NomeTabela do arquivo principal ───────────────────────────────────
-            id_evt_principal = (
-                _ler_identificacao_evento(self._arquivo_principal)
-                if self._arquivo_principal else {}
-            )
-            id_norm_principal = {_norm_aba(k): v for k, v in id_evt_principal.items()}
-            nome_tabela_principal = id_norm_principal.get("nometabela", "")
-
-            # ── Helpers ──────────────────────────────────────────────────────────
-            def _id_reservado(v):
-                return (1000 <= v < 2000) or (20000 <= v <= 21000)
-
-            def _set_raw(raw, val, std_key, *norm_alts):
-                for k in list(raw.keys()):
-                    if _norm_aba(k) in norm_alts:
-                        raw[k] = str(val)
-                        return
-                raw[std_key] = str(val)
-
-            _SKIP_MERGE = {
-                "persistencia", "persistência",
-                "mapaatributo",
-                "posicaoinicial", "posinicial",
-                "posicaofinal", "posfinal",
-                "identificadorcampo",
-            }
-
-            def _mesclar_persistencia(raw, nome_campo):
-                """Mescla dados de persistência da origem e força NomeTabela principal."""
-                pers_raw = pers_idx.get(_norm_aba(nome_campo), {})
-                for k, v in pers_raw.items():
-                    if _norm_aba(k) not in _SKIP_MERGE:
-                        raw.setdefault(k, v)
-                # NomeTabela sempre vem do arquivo principal
-                if nome_tabela_principal:
-                    _set_raw(raw, nome_tabela_principal, "NomeTabela", "nometabela")
-
-            def _mesclar_mapa(raw, nome_campo):
-                """Mescla dados de mapa de atributo da origem."""
-                mapa_raw = mapa_idx.get(_norm_aba(nome_campo), {})
-                for k, v in mapa_raw.items():
-                    if _norm_aba(k) not in _SKIP_MERGE:
-                        raw.setdefault(k, v)
-
-            # ── Próximo IdentificadorCampo sequencial ─────────────────────────────
-            used_ids = []
-            for c in self._campos:
-                try:
-                    v = int(float(c.get("id", "")))
-                    if not _id_reservado(v):
-                        used_ids.append(v)
-                except (ValueError, TypeError):
-                    pass
-            next_id = (max(used_ids) + 1) if used_ids else 1
-
-            # ── Adiciona campos novos ─────────────────────────────────────────────
-            for orig in novos:
-                novo      = dict(orig)
-                novo["_raw"] = dict(orig.get("_raw", {}))
-                raw       = novo["_raw"]
-
-                # Se Persistência=S, mescla dados do tab de persistência da origem
-                if _raw_flag(raw, "Persistência", "Persistencia"):
-                    _mesclar_persistencia(raw, novo.get("nome", ""))
-                # Se MapaAtributo=S, mescla dados de mapa de atributo da origem
-                if _raw_flag(raw, "MapaAtributo"):
-                    _mesclar_mapa(raw, novo.get("nome", ""))
-
-                # Posição sequencial da planilha principal
-                ativos = [c for c in self._campos if c.get("pos_ini") and c.get("tamanho")]
-                prox   = (max(c["pos_ini"] + c["tamanho"] for c in ativos) if ativos else 1)
-                novo["pos_ini"] = prox
-                if novo.get("tamanho"):
-                    novo["pos_fin"] = prox + novo["tamanho"] - 1
-                _set_raw(raw, prox, "PosicaoInicial", "posicaoinicial", "posinicial")
-                if novo.get("pos_fin"):
-                    _set_raw(raw, novo["pos_fin"], "PosicaoFinal", "posicaofinal", "posfinal")
-
-                # IdentificadorCampo sequencial da planilha principal
-                novo["id"] = str(next_id)
-                _set_raw(raw, next_id, "IdentificadorCampo", "identificadorcampo")
-
-                self._campos.append(novo)
-                next_id += 1
-
-            # ── Duplicatas ────────────────────────────────────────────────────────
-            atualizados = 0
+            # ── Pergunta sobre duplicatas ANTES de entrar na thread ───────────────
+            atualizar_dup = False
             if duplicatas:
                 nomes_dup = "\n".join(f"  • {e.get('nome')}" for e, _ in duplicatas)
-                if messagebox.askyesno("Campos já existem",
-                        f"Os seguintes campos já existem na planilha principal:\n{nomes_dup}\n\n"
-                        "Deseja atualizar os atributos deles (tipo, tamanho, alinhamento etc.)?"):
+                atualizar_dup = messagebox.askyesno(
+                    "Campos já existem",
+                    f"Os seguintes campos já existem na planilha principal:\n{nomes_dup}\n\n"
+                    "Deseja atualizar os atributos deles (tipo, tamanho, alinhamento etc.)?"
+                )
+
+            total = len(novos) + (len(duplicatas) if atualizar_dup else 0)
+            if total == 0 and not novos:
+                return
+
+            janela = JanelaCarregando(
+                self.root,
+                f"Copiando campos...\n0 de {len(novos)}"
+            )
+
+            def _runner():
+                # ── Índices de dados específicos da origem ────────────────────────
+                pers_idx = {}
+                mapa_idx = {}
+                for nome_aba, info in self._dados_por_aba_origem.items():
+                    n_aba = _norm_aba(nome_aba)
+                    for idx, patts in [(pers_idx, ("persistenc",)),
+                                       (mapa_idx, ("ruleattribute", "mapaatributo", "attributemap"))]:
+                        if any(n_aba.startswith(p) for p in patts):
+                            for c in info.get("campos", []):
+                                raw_p = c.get("_raw", {})
+                                rn_p  = {_norm_aba(k): v for k, v in raw_p.items()}
+                                nc = rn_p.get("nomecampo", "") or c.get("nome", "")
+                                if nc:
+                                    idx.setdefault(_norm_aba(nc), raw_p)
+                            break
+
+                # ── NomeTabela do arquivo principal ───────────────────────────────
+                id_evt_principal = (
+                    _ler_identificacao_evento(self._arquivo_principal)
+                    if self._arquivo_principal else {}
+                )
+                id_norm_principal = {_norm_aba(k): v for k, v in id_evt_principal.items()}
+                nome_tabela_principal = id_norm_principal.get("nometabela", "")
+
+                # ── Helpers ──────────────────────────────────────────────────────
+                def _id_reservado(v):
+                    return (1000 <= v < 2000) or (20000 <= v <= 21000)
+
+                def _set_raw(raw, val, std_key, *norm_alts):
+                    for k in list(raw.keys()):
+                        if _norm_aba(k) in norm_alts:
+                            raw[k] = str(val)
+                            return
+                    raw[std_key] = str(val)
+
+                _SKIP_MERGE = {
+                    "persistencia", "persistência",
+                    "mapaatributo",
+                    "posicaoinicial", "posinicial",
+                    "posicaofinal", "posfinal",
+                    "identificadorcampo",
+                }
+
+                def _mesclar_persistencia(raw, nome_campo):
+                    pers_raw = pers_idx.get(_norm_aba(nome_campo), {})
+                    for k, v in pers_raw.items():
+                        if _norm_aba(k) not in _SKIP_MERGE:
+                            raw.setdefault(k, v)
+                    if nome_tabela_principal:
+                        _set_raw(raw, nome_tabela_principal, "NomeTabela", "nometabela")
+
+                def _mesclar_mapa(raw, nome_campo):
+                    mapa_raw = mapa_idx.get(_norm_aba(nome_campo), {})
+                    for k, v in mapa_raw.items():
+                        if _norm_aba(k) not in _SKIP_MERGE:
+                            raw.setdefault(k, v)
+
+                # ── Próximo IdentificadorCampo sequencial ─────────────────────────
+                used_ids = []
+                for c in self._campos:
+                    try:
+                        v = int(float(c.get("id", "")))
+                        if not _id_reservado(v):
+                            used_ids.append(v)
+                    except (ValueError, TypeError):
+                        pass
+                next_id = (max(used_ids) + 1) if used_ids else 1
+
+                # ── Processar campos novos ────────────────────────────────────────
+                campos_adicionados = []
+                for i, orig in enumerate(novos):
+                    if janela.cancelado:
+                        break
+                    msg = f"Copiando campos...\n{i + 1} de {len(novos)}"
+                    self.root.after(0, lambda m=msg: janela.atualizar(m))
+
+                    novo      = dict(orig)
+                    novo["_raw"] = dict(orig.get("_raw", {}))
+                    raw       = novo["_raw"]
+
+                    if _raw_flag(raw, "Persistência", "Persistencia"):
+                        _mesclar_persistencia(raw, novo.get("nome", ""))
+                    if _raw_flag(raw, "MapaAtributo"):
+                        _mesclar_mapa(raw, novo.get("nome", ""))
+
+                    ativos = [c for c in self._campos if c.get("pos_ini") and c.get("tamanho")]
+                    prox   = (max(c["pos_ini"] + c["tamanho"] for c in ativos) if ativos else 1)
+                    novo["pos_ini"] = prox
+                    if novo.get("tamanho"):
+                        novo["pos_fin"] = prox + novo["tamanho"] - 1
+                    _set_raw(raw, prox, "PosicaoInicial", "posicaoinicial", "posinicial")
+                    if novo.get("pos_fin"):
+                        _set_raw(raw, novo["pos_fin"], "PosicaoFinal", "posicaofinal", "posfinal")
+
+                    novo["id"] = str(next_id)
+                    _set_raw(raw, next_id, "IdentificadorCampo", "identificadorcampo")
+
+                    self._campos.append(novo)
+                    campos_adicionados.append(novo)
+                    next_id += 1
+
+                # ── Processar duplicatas (se aprovado) ────────────────────────────
+                atualizados = 0
+                if atualizar_dup and not janela.cancelado:
+                    self.root.after(0, lambda: janela.atualizar("Atualizando duplicatas..."))
                     for existente, orig in duplicatas:
                         for key in ("tipo", "tamanho", "alinhamento", "descricao",
                                     "obrigatorio", "coluna_db", "valor_padrao"):
@@ -2377,7 +2395,6 @@ class GeradorXMLApp:
                                 existente[key] = orig[key]
                         if not existente.get("valor"):
                             existente["valor"] = orig.get("valor_padrao", "")
-                        # Atualiza também dados de persistência, mapa de atributo e NomeTabela
                         raw_ex = existente.setdefault("_raw", {})
                         if _raw_flag(raw_ex, "Persistência", "Persistencia"):
                             _mesclar_persistencia(raw_ex, existente.get("nome", ""))
@@ -2385,14 +2402,32 @@ class GeradorXMLApp:
                             _mesclar_mapa(raw_ex, existente.get("nome", ""))
                         atualizados += 1
 
-            self._atualizar_tabela()
-            partes = []
-            if novos:
-                partes.append(f"{len(novos)} copiado(s)")
-            if atualizados:
-                partes.append(f"{atualizados} atualizado(s)")
-            if partes:
-                self._set_status(f"Campos da origem: {', '.join(partes)}.")
+                cancelado = janela.cancelado
+                self.root.after(0, lambda: _finalizar(campos_adicionados, atualizados, cancelado))
+
+            def _finalizar(campos_adicionados, atualizados, cancelado):
+                janela.fechar()
+                if cancelado:
+                    # Rollback: remove campos já adicionados nesta operação
+                    for c in campos_adicionados:
+                        try:
+                            self._campos.remove(c)
+                        except ValueError:
+                            pass
+                    self._set_status("Cópia cancelada — nenhuma alteração aplicada.")
+                    self._atualizar_tabela()
+                    return
+
+                self._atualizar_tabela()
+                partes = []
+                if campos_adicionados:
+                    partes.append(f"{len(campos_adicionados)} copiado(s)")
+                if atualizados:
+                    partes.append(f"{atualizados} atualizado(s)")
+                if partes:
+                    self._set_status(f"Campos da origem: {', '.join(partes)}.")
+
+            threading.Thread(target=_runner, daemon=True).start()
 
         JanelaCopiarCampos(self.root, self._dados_por_aba_origem, on_confirmar=_processar)
 
@@ -2740,91 +2775,107 @@ class GeradorXMLApp:
         if not dir_saida:
             return
 
-        gerados      = []
-        erros_geracao = []
+        # Captura referências antes de entrar na thread
+        _dados       = self._dados_por_aba
+        _arquivo     = self._arquivo_principal
+        _headers     = aba_entrada.get("headers", [])  if aba_entrada else self._headers_ativos
+        _sections    = aba_entrada.get("sections", {}) if aba_entrada else self._sections_ativos
 
-        # 1. LayoutEntrada.xml
-        try:
-            xml_str = construir_xml(
-                campos_validar,
-                aba_entrada.get("headers", [])  if aba_entrada else self._headers_ativos,
-                "Campos Entrada",
-                aba_entrada.get("sections", {}) if aba_entrada else self._sections_ativos,
-            )
-            path = os.path.join(dir_saida, "LayoutEntrada.xml")
-            with open(path, "w", encoding="utf-8") as f:
-                f.write(xml_str)
-            gerados.append("LayoutEntrada.xml")
-            self._atualizar_tab_xml("LayoutEntrada", xml_str)
-        except Exception as e:
-            erros_geracao.append(f"LayoutEntrada.xml: {e}")
-
-        # 2. LayoutPersistencia.xml
-        try:
-            xml_str = construir_xml_persistencia(
-                self._dados_por_aba, self._arquivo_principal
-            )
-            path = os.path.join(dir_saida, "LayoutPersistencia.xml")
-            with open(path, "w", encoding="utf-8") as f:
-                f.write(xml_str)
-            gerados.append("LayoutPersistencia.xml")
-            self._atualizar_tab_xml("LayoutPersistencia", xml_str)
-        except Exception as e:
-            erros_geracao.append(f"LayoutPersistencia.xml: {e}")
-
-        # 3. mapaAtributo.xml
-        try:
-            xml_str = construir_xml_mapa_atributo(
-                self._dados_por_aba, self._arquivo_principal
-            )
-            path = os.path.join(dir_saida, "mapaAtributo.xml")
-            with open(path, "w", encoding="utf-8") as f:
-                f.write(xml_str)
-            gerados.append("mapaAtributo.xml")
-            self._atualizar_tab_xml("mapaAtributo", xml_str)
-        except Exception as e:
-            erros_geracao.append(f"mapaAtributo.xml: {e}")
-
-        # 4. DadoExterno.xml (Enriquecimento)
-        try:
-            xml_str = construir_xml_enriquecimento(self._dados_por_aba)
-            path = os.path.join(dir_saida, "DadoExterno.xml")
-            with open(path, "w", encoding="utf-8") as f:
-                f.write(xml_str)
-            gerados.append("DadoExterno.xml")
-            self._atualizar_tab_xml("DadoExterno", xml_str)
-        except Exception as e:
-            erros_geracao.append(f"DadoExterno.xml: {e}")
-
-        # 5. ComandoSQL.sql
-        try:
-            sql_str = gerar_comandos_sql(self._dados_por_aba, self._arquivo_principal)
-            path = os.path.join(dir_saida, "ComandoSQL.sql")
-            with open(path, "w", encoding="utf-8") as f:
-                f.write(sql_str)
-            gerados.append("ComandoSQL.sql")
-            self._atualizar_tab_xml("ComandoSQL", sql_str)
-        except Exception as e:
-            erros_geracao.append(f"ComandoSQL.sql: {e}")
-
-        # Resultado
-        linhas_ok  = "\n".join(f"  ✔ {n}" for n in gerados)
-        linhas_err = "\n".join(f"  ✗ {e}" for e in erros_geracao)
-        msg = f"XMLs gerados em:\n{dir_saida}\n\n{linhas_ok}"
-        if erros_geracao:
-            msg += f"\n\nErros:\n{linhas_err}"
-            messagebox.showwarning("XMLs gerados com erros", msg)
-        else:
-            messagebox.showinfo("Sucesso", msg)
-
-        # Seleciona a aba LayoutEntrada para o usuário ver o resultado
-        if gerados:
-            self._notebook.select(1)
-
-        self._set_status(
-            f"{len(gerados)} XML(s) gerado(s) em: {os.path.basename(dir_saida)}"
-            + (f"  |  {len(erros_geracao)} erro(s)" if erros_geracao else "")
+        # Prefixo do nome dos arquivos: campo "Identificador" da aba "Identificação Evento"
+        # Fallback: stem do arquivo principal; último fallback: "LAYOUT"
+        _id_evt  = _ler_identificacao_evento(_arquivo) if _arquivo else {}
+        _id_norm = {_norm_aba(k): v for k, v in _id_evt.items()}
+        _prefixo = (
+            _id_norm.get("identificadorevento")
+            or (os.path.splitext(os.path.basename(_arquivo))[0] if _arquivo else "")
+            or "LAYOUT"
         )
+
+        # Nome da cópia da planilha no diretório de saída
+        _ext_planilha  = os.path.splitext(_arquivo)[1] if _arquivo else ".xlsx"
+        _nome_planilha = f"evento_event_{_prefixo}{_ext_planilha}"
+
+        # (key_preview, nome_arquivo, progresso)  — None em key_preview = não é XML de preview
+        _total = 6 if _arquivo else 5
+        _tarefas = [
+            ("LayoutEntrada",      f"{_prefixo}_Layout_entrada.xml",      f"1/{_total}"),
+            ("LayoutPersistencia", f"{_prefixo}_Layout_persistencia.xml",  f"2/{_total}"),
+            ("mapaAtributo",       f"{_prefixo}_Layout_mapa_atributo.xml", f"3/{_total}"),
+            ("DadoExterno",        f"{_prefixo}_Layout_enriquecimento.xml",f"4/{_total}"),
+            ("ComandoSQL",         "ComandoSQL.sql",                        f"5/{_total}"),
+        ]
+        if _arquivo:
+            _tarefas.append((None, _nome_planilha, f"6/{_total}"))
+
+        janela = JanelaCarregando(self.root, f"Gerando arquivos...\n1 de {_total}")
+
+        def _runner():
+            gerados       = []
+            erros_geracao = []
+            xmls_preview  = {}
+
+            for key_preview, nome_arq, progresso in _tarefas:
+                if janela.cancelado:
+                    break
+                self.root.after(0, lambda m=f"Gerando:\n{nome_arq}\n\n{progresso}": janela.atualizar(m))
+                try:
+                    if key_preview == "LayoutEntrada":
+                        conteudo = construir_xml(campos_validar, _headers, "Campos Entrada", _sections)
+                    elif key_preview == "LayoutPersistencia":
+                        conteudo = construir_xml_persistencia(_dados, _arquivo)
+                    elif key_preview == "mapaAtributo":
+                        conteudo = construir_xml_mapa_atributo(_dados, _arquivo)
+                    elif key_preview == "DadoExterno":
+                        conteudo = construir_xml_enriquecimento(_dados)
+                    elif key_preview == "ComandoSQL":
+                        conteudo = gerar_comandos_sql(_dados, _arquivo)
+                    else:
+                        # Cópia da planilha — usa salvar_xlsx_estruturado
+                        path_destino = os.path.join(dir_saida, nome_arq)
+                        salvar_xlsx_estruturado(_arquivo, path_destino, _dados)
+                        gerados.append(nome_arq)
+                        continue
+
+                    path = os.path.join(dir_saida, nome_arq)
+                    with open(path, "w", encoding="utf-8") as f:
+                        f.write(conteudo)
+                    gerados.append(nome_arq)
+                    xmls_preview[key_preview] = conteudo
+                except Exception as e:
+                    erros_geracao.append(f"{nome_arq}: {e}")
+
+            cancelado = janela.cancelado
+            self.root.after(0, lambda: _finalizar(gerados, erros_geracao, xmls_preview, cancelado))
+
+        def _finalizar(gerados, erros_geracao, xmls_preview, cancelado):
+            janela.fechar()
+
+            if cancelado:
+                self._set_status("Geração cancelada.")
+                return
+
+            # Atualiza abas de preview
+            for key, conteudo in xmls_preview.items():
+                self._atualizar_tab_xml(key, conteudo)
+
+            linhas_ok  = "\n".join(f"  ✔ {n}" for n in gerados)
+            linhas_err = "\n".join(f"  ✗ {e}" for e in erros_geracao)
+            msg = f"Arquivos gerados em:\n{dir_saida}\n\n{linhas_ok}"
+            if erros_geracao:
+                msg += f"\n\nErros:\n{linhas_err}"
+                messagebox.showwarning("Geração com erros", msg)
+            else:
+                messagebox.showinfo("Sucesso", msg)
+
+            if gerados:
+                self._notebook.select(1)
+
+            self._set_status(
+                f"{len(gerados)} arquivo(s) gerado(s) em: {os.path.basename(dir_saida)}"
+                + (f"  |  {len(erros_geracao)} erro(s)" if erros_geracao else "")
+            )
+
+        threading.Thread(target=_runner, daemon=True).start()
 
     # ── Utilidades ────────────────────────────────────────────────────────────
 
