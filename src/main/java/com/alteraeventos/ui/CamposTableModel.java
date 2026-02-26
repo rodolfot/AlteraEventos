@@ -8,7 +8,7 @@ import java.util.List;
 
 /**
  * TableModel para exibir os campos de entrada em uma JTable.
- * Permite edição do campo "Valor" (coluna 9).
+ * Compatível com Java 8.
  */
 public class CamposTableModel extends AbstractTableModel {
 
@@ -37,13 +37,9 @@ public class CamposTableModel extends AbstractTableModel {
         fireTableDataChanged();
     }
 
-    public List<CampoEntrada> getCampos() {
-        return campos;
-    }
+    public List<CampoEntrada> getCampos() { return campos; }
 
-    public CampoEntrada getCampo(int rowIndex) {
-        return campos.get(rowIndex);
-    }
+    public CampoEntrada getCampo(int rowIndex) { return campos.get(rowIndex); }
 
     public void adicionarCampo(CampoEntrada campo) {
         campos.add(campo);
@@ -60,50 +56,28 @@ public class CamposTableModel extends AbstractTableModel {
         fireTableRowsUpdated(rowIndex, rowIndex);
     }
 
-    @Override
-    public int getRowCount() {
-        return campos != null ? campos.size() : 0;
-    }
-
-    @Override
-    public int getColumnCount() {
-        return NOMES_COLUNAS.length;
-    }
-
-    @Override
-    public String getColumnName(int col) {
-        return NOMES_COLUNAS[col];
-    }
-
-    @Override
-    public Class<?> getColumnClass(int col) {
-        return TIPOS_COLUNAS[col];
-    }
-
-    @Override
-    public boolean isCellEditable(int row, int col) {
-        // Apenas a coluna "Valor" é editável diretamente na tabela
-        return col == 9;
-    }
+    @Override public int getRowCount() { return campos != null ? campos.size() : 0; }
+    @Override public int getColumnCount() { return NOMES_COLUNAS.length; }
+    @Override public String getColumnName(int col) { return NOMES_COLUNAS[col]; }
+    @Override public Class<?> getColumnClass(int col) { return TIPOS_COLUNAS[col]; }
+    @Override public boolean isCellEditable(int row, int col) { return col == 9; }
 
     @Override
     public Object getValueAt(int row, int col) {
         CampoEntrada c = campos.get(row);
-        return switch (col) {
-            case 0 -> c.getIdentificadorCampo();
-            case 1 -> c.getNomeCampo();
-            case 2 -> c.getDescricaoCampo();
-            case 3 -> c.getTipoCampo();
-            case 4 -> c.getTamanhoCampo();
-            case 5 -> c.getPosicaoInicial();
-            case 6 -> c.getPosicaoFinal() != null
-                    ? c.getPosicaoFinal()
-                    : c.calcularPosicaoFinalEsperada();
-            case 7 -> c.getAlinhamentoCampo();
-            case 8 -> c.getCampoObrigatorio();
-            case 9 -> c.getValorUsuario();
-            default -> null;
-        };
+        switch (col) {
+            case 0: return c.getIdentificadorCampo();
+            case 1: return c.getNomeCampo();
+            case 2: return c.getDescricaoCampo();
+            case 3: return c.getTipoCampo();
+            case 4: return c.getTamanhoCampo();
+            case 5: return c.getPosicaoInicial();
+            case 6: return c.getPosicaoFinal() != null ? c.getPosicaoFinal() : c.calcularPosicaoFinalEsperada();
+            case 7: return c.getAlinhamentoCampo();
+            case 8: return c.getCampoObrigatorio();
+            case 9: return c.getValorUsuario();
+            default: return null;
+        }
     }
 
     @Override

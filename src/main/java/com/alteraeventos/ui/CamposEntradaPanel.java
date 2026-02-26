@@ -3,15 +3,19 @@ package com.alteraeventos.ui;
 import com.alteraeventos.model.CampoEntrada;
 import com.alteraeventos.model.ResultadoValidacao;
 import com.alteraeventos.service.ValidacaoService;
-import com.alteraeventos.service.XmlService;
 
 import javax.swing.*;
 import javax.swing.border.TitledBorder;
+import javax.swing.event.ChangeEvent;
+import javax.swing.event.ChangeListener;
 import javax.swing.event.DocumentEvent;
 import javax.swing.event.DocumentListener;
 import javax.swing.event.ListSelectionEvent;
+import javax.swing.event.ListSelectionListener;
 import javax.swing.table.TableRowSorter;
 import java.awt.*;
+import java.awt.event.ActionEvent;
+import java.awt.event.ActionListener;
 import java.awt.event.MouseAdapter;
 import java.awt.event.MouseEvent;
 import java.util.List;
@@ -19,11 +23,7 @@ import java.util.regex.PatternSyntaxException;
 
 /**
  * Painel principal de exibição e edição dos campos de entrada.
- * Contém:
- *  - Barra de filtro
- *  - Tabela com todos os campos
- *  - Painel de detalhes do campo selecionado
- *  - Botões de ação
+ * Compatível com Java 8.
  */
 public class CamposEntradaPanel extends JPanel {
 
@@ -33,9 +33,8 @@ public class CamposEntradaPanel extends JPanel {
     private final JTextField filtroField;
 
     private final ValidacaoService validacaoService = new ValidacaoService();
-    private final XmlService xmlService = new XmlService();
 
-    // Painel de detalhes do campo selecionado
+    // Painel de detalhes
     private final JTextField txtNome = new JTextField();
     private final JTextField txtDescricao = new JTextField();
     private final JComboBox<String> cmbTipo;
@@ -50,55 +49,40 @@ public class CamposEntradaPanel extends JPanel {
     private final JTextField txtNomeColuna = new JTextField();
     private final JTextField txtOracleType = new JTextField();
 
-    // Callback para notificar operações (atualizar planilha, gerar XML)
     private Runnable onAtualizarPlanilha;
     private Runnable onGerarXml;
 
-    // Índice da linha selecionada
     private int linhaSelecionada = -1;
     private boolean atualizandoDetalhes = false;
 
     public CamposEntradaPanel() {
         setLayout(new BorderLayout(0, 0));
 
-        // Tipos de campo disponíveis
         cmbTipo = new JComboBox<>(new String[]{
             "TEXTO", "INTEIRO", "INTEIRO_LONGO", "DECIMAL",
             "DATA", "DATA_HORA", "HORA", "BOOLEANO"
         });
-
-        // Tipos de alinhamento
         cmbAlinhamento = new JComboBox<>(new String[]{
             "", "BRANCO_ESQUERDA", "BRANCO_DIREITA", "ZERO_ESQUERDA", "ZERO_DIREITA"
         });
-
         cmbObrigatorio = new JComboBox<>(new String[]{"", "S", "N"});
         cmbEntrada = new JComboBox<>(new String[]{"S", "N"});
 
-        // Inicializa o modelo da tabela
         tableModel = new CamposTableModel();
-
         tabela = new JTable(tableModel);
         sorter = new TableRowSorter<>(tableModel);
         tabela.setRowSorter(sorter);
 
         configurarTabela();
 
-        // Layout geral
-        JPanel topoPanel = criarPainelFiltro();
         JSplitPane splitPane = new JSplitPane(JSplitPane.HORIZONTAL_SPLIT,
                 criarPainelTabela(), criarPainelDetalhes());
         splitPane.setResizeWeight(0.65);
-        splitPane.setDividerLocation(0.65);
 
-        add(topoPanel, BorderLayout.NORTH);
+        add(criarPainelFiltro(), BorderLayout.NORTH);
         add(splitPane, BorderLayout.CENTER);
         add(criarPainelBotoes(), BorderLayout.SOUTH);
     }
-
-    // =========================================================
-    // Configuração da Tabela
-    // =========================================================
 
     private void configurarTabela() {
         tabela.setSelectionMode(ListSelectionModel.SINGLE_SELECTION);
@@ -107,52 +91,44 @@ public class CamposEntradaPanel extends JPanel {
         tabela.setRowHeight(22);
         tabela.getTableHeader().setReorderingAllowed(false);
 
-        // Larguras das colunas
         int[] larguras = {40, 200, 250, 100, 70, 85, 75, 140, 60, 150};
         for (int i = 0; i < larguras.length && i < tabela.getColumnCount(); i++) {
             tabela.getColumnModel().getColumn(i).setPreferredWidth(larguras[i]);
         }
 
-        // Seleção de linha → atualiza detalhes
-        tabela.getSelectionModel().addListSelectionListener((ListSelectionEvent e) -> {
-            if (!e.getValueIsAdjusting()) {
-                int viewRow = tabela.getSelectedRow();
-                if (viewRow >= 0) {
-                    linhaSelecionada = tabela.convertRowIndexToModel(viewRow);
-                    preencherDetalhes(tableModel.getCampo(linhaSelecionada));
-                } else {
-                    linhaSelecionada = -1;
-                    limparDetalhes();
-                }
-            }
-        });
-
-        // Duplo clique abre edição rápida de valor
-        tabela.addMouseListener(new MouseAdapter() {
+        tabela.getSelectionModel().addListSelectionListener(new ListSelectionListener() {
             @Override
-            public void mouseClicked(MouseEvent e) {
-                if (e.getClickCount() == 2) {
-                    int viewCol = tabela.columnAtPoint(e.getPoint());
-                    int modelCol = tabela.convertColumnIndexToModel(viewCol);
-                    if (modelCol != 9) { // não coluna Valor
-                        txtValorUsuario.requestFocusInWindow();
-                        txtValorUsuario.selectAll();
+            public void valueChanged(ListSelectionEvent e) {
+                if (!e.getValueIsAdjusting()) {
+                    int viewRow = tabela.getSelectedRow();
+                    if (viewRow >= 0) {
+                        linhaSelecionada = tabela.convertRowIndexToModel(viewRow);
+                        preencherDetalhes(tableModel.getCampo(linhaSelecionada));
+                    } else {
+                        linhaSelecionada = -1;
+                        limparDetalhes();
                     }
                 }
             }
         });
-    }
 
-    // =========================================================
-    // Criação de Painéis
-    // =========================================================
+        tabela.addMouseListener(new MouseAdapter() {
+            @Override
+            public void mouseClicked(MouseEvent e) {
+                if (e.getClickCount() == 2) {
+                    txtValorUsuario.requestFocusInWindow();
+                    txtValorUsuario.selectAll();
+                }
+            }
+        });
+    }
 
     private JPanel criarPainelFiltro() {
         JPanel panel = new JPanel(new FlowLayout(FlowLayout.LEFT, 8, 4));
         panel.setBorder(BorderFactory.createEmptyBorder(4, 4, 0, 4));
 
         filtroField = new JTextField(30);
-        filtroField.setToolTipText("Filtrar por nome ou descrição do campo");
+        filtroField.setToolTipText("Filtrar por nome ou descrição");
 
         filtroField.getDocument().addDocumentListener(new DocumentListener() {
             public void insertUpdate(DocumentEvent e) { aplicarFiltro(); }
@@ -160,13 +136,17 @@ public class CamposEntradaPanel extends JPanel {
             public void changedUpdate(DocumentEvent e) { aplicarFiltro(); }
         });
 
+        JButton btnLimpar = new JButton("Limpar");
+        btnLimpar.addActionListener(new ActionListener() {
+            public void actionPerformed(ActionEvent e) {
+                filtroField.setText("");
+                aplicarFiltro();
+            }
+        });
+
         panel.add(new JLabel("Filtrar:"));
         panel.add(filtroField);
-
-        JButton btnLimpar = new JButton("Limpar");
-        btnLimpar.addActionListener(e -> { filtroField.setText(""); aplicarFiltro(); });
         panel.add(btnLimpar);
-
         return panel;
     }
 
@@ -175,10 +155,7 @@ public class CamposEntradaPanel extends JPanel {
         panel.setBorder(BorderFactory.createTitledBorder(
                 BorderFactory.createEtchedBorder(), "Campos de Entrada",
                 TitledBorder.LEFT, TitledBorder.TOP));
-
-        JScrollPane scroll = new JScrollPane(tabela);
-        scroll.setHorizontalScrollBarPolicy(ScrollPaneConstants.HORIZONTAL_SCROLLBAR_AS_NEEDED);
-        panel.add(scroll, BorderLayout.CENTER);
+        panel.add(new JScrollPane(tabela), BorderLayout.CENTER);
         return panel;
     }
 
@@ -209,45 +186,49 @@ public class CamposEntradaPanel extends JPanel {
         fb.gridx = 1; fb.weightx = 1.0;
 
         int row = 0;
-        adicionarLinha(form, lb, fb, row++, "Entrada:", cmbEntrada);
-        adicionarLinha(form, lb, fb, row++, "Nome:", txtNome);
-        adicionarLinha(form, lb, fb, row++, "Descrição:", txtDescricao);
-        adicionarLinha(form, lb, fb, row++, "Tipo:", cmbTipo);
-        adicionarLinha(form, lb, fb, row++, "Tamanho:", spnTamanho);
-        adicionarLinha(form, lb, fb, row++, "Pos. Inicial:", spnPosInicial);
-        adicionarLinha(form, lb, fb, row++, "Pos. Final:", txtPosFinal);
-        adicionarLinha(form, lb, fb, row++, "Alinhamento:", cmbAlinhamento);
-        adicionarLinha(form, lb, fb, row++, "Obrigatório:", cmbObrigatorio);
-        adicionarLinha(form, lb, fb, row++, "Valor Padrão:", txtValorPadrao);
+        addRow(form, lb, fb, row++, "Entrada:", cmbEntrada);
+        addRow(form, lb, fb, row++, "Nome:", txtNome);
+        addRow(form, lb, fb, row++, "Descrição:", txtDescricao);
+        addRow(form, lb, fb, row++, "Tipo:", cmbTipo);
+        addRow(form, lb, fb, row++, "Tamanho:", spnTamanho);
+        addRow(form, lb, fb, row++, "Pos. Inicial:", spnPosInicial);
+        addRow(form, lb, fb, row++, "Pos. Final:", txtPosFinal);
+        addRow(form, lb, fb, row++, "Alinhamento:", cmbAlinhamento);
+        addRow(form, lb, fb, row++, "Obrigatório:", cmbObrigatorio);
+        addRow(form, lb, fb, row++, "Valor Padrão:", txtValorPadrao);
 
-        // Separador visual
         GridBagConstraints sepC = new GridBagConstraints();
         sepC.gridx = 0; sepC.gridy = row++; sepC.gridwidth = 2;
         sepC.fill = GridBagConstraints.HORIZONTAL;
         sepC.insets = new Insets(6, 0, 6, 0);
         form.add(new JSeparator(), sepC);
 
-        adicionarLinha(form, lb, fb, row++, "Valor (XML):", txtValorUsuario);
-        adicionarLinha(form, lb, fb, row++, "Coluna DB:", txtNomeColuna);
-        adicionarLinha(form, lb, fb, row, "Tipo Oracle:", txtOracleType);
+        addRow(form, lb, fb, row++, "Valor (XML):", txtValorUsuario);
+        addRow(form, lb, fb, row++, "Coluna DB:", txtNomeColuna);
+        addRow(form, lb, fb, row, "Tipo Oracle:", txtOracleType);
 
-        // Botão Aplicar
+        // Listeners para recalcular Pos. Final automaticamente
+        ChangeListener posListener = new ChangeListener() {
+            public void stateChanged(ChangeEvent e) { atualizarPosFinal(); }
+        };
+        spnTamanho.addChangeListener(posListener);
+        spnPosInicial.addChangeListener(posListener);
+
         JPanel btnPanel = new JPanel(new FlowLayout(FlowLayout.RIGHT, 4, 4));
         JButton btnAplicar = new JButton("Aplicar Alterações");
-        btnAplicar.setToolTipText("Salva as alterações do campo na tabela (sem gravar na planilha)");
-        btnAplicar.addActionListener(e -> aplicarAlteracoesDetalhes());
+        btnAplicar.addActionListener(new ActionListener() {
+            public void actionPerformed(ActionEvent e) { aplicarAlteracoesDetalhes(); }
+        });
         btnPanel.add(btnAplicar);
 
         panel.add(new JScrollPane(form), BorderLayout.CENTER);
         panel.add(btnPanel, BorderLayout.SOUTH);
 
-        configurarListenersDetalhes();
-
         return panel;
     }
 
-    private void adicionarLinha(JPanel panel, GridBagConstraints lb, GridBagConstraints fb,
-                                 int row, String label, JComponent comp) {
+    private void addRow(JPanel panel, GridBagConstraints lb, GridBagConstraints fb,
+                         int row, String label, JComponent comp) {
         lb.gridy = row;
         fb.gridy = row;
         panel.add(new JLabel(label), lb);
@@ -259,46 +240,40 @@ public class CamposEntradaPanel extends JPanel {
         panel.setBorder(BorderFactory.createEmptyBorder(0, 4, 4, 4));
 
         JButton btnValidar = new JButton("Validar Campos");
-        btnValidar.setIcon(UIManager.getIcon("OptionPane.informationIcon") != null
-                ? UIManager.getIcon("OptionPane.informationIcon") : null);
-        btnValidar.setToolTipText("Valida posições e tamanhos dos campos");
-        btnValidar.addActionListener(e -> validarCampos());
+        btnValidar.addActionListener(new ActionListener() {
+            public void actionPerformed(ActionEvent e) { validarCampos(); }
+        });
 
         JButton btnRecalcular = new JButton("Recalcular Posições");
-        btnRecalcular.setToolTipText("Recalcula automaticamente PosicaoInicial e PosicaoFinal de todos os campos");
-        btnRecalcular.addActionListener(e -> recalcularPosicoes());
+        btnRecalcular.addActionListener(new ActionListener() {
+            public void actionPerformed(ActionEvent e) { recalcularPosicoes(); }
+        });
 
         JButton btnAtualizar = new JButton("Atualizar Planilha");
-        btnAtualizar.setToolTipText("Salva as alterações de volta no arquivo Excel");
-        btnAtualizar.addActionListener(e -> { if (onAtualizarPlanilha != null) onAtualizarPlanilha.run(); });
+        btnAtualizar.addActionListener(new ActionListener() {
+            public void actionPerformed(ActionEvent e) {
+                if (onAtualizarPlanilha != null) onAtualizarPlanilha.run();
+            }
+        });
 
         JButton btnGerarXml = new JButton("Gerar XML");
-        btnGerarXml.setToolTipText("Gera o arquivo XML com as posições e valores dos campos");
-        btnGerarXml.addActionListener(e -> { if (onGerarXml != null) onGerarXml.run(); });
+        btnGerarXml.addActionListener(new ActionListener() {
+            public void actionPerformed(ActionEvent e) {
+                if (onGerarXml != null) onGerarXml.run();
+            }
+        });
 
         panel.add(btnValidar);
         panel.add(btnRecalcular);
         panel.add(new JSeparator(SwingConstants.VERTICAL));
         panel.add(btnAtualizar);
         panel.add(btnGerarXml);
-
         return panel;
     }
 
     // =========================================================
-    // Lógica dos detalhes
+    // Detalhes
     // =========================================================
-
-    private void configurarListenersDetalhes() {
-        // Atualiza PosicaoFinal ao alterar Tamanho ou PosicaoInicial
-        ChangeListener posListener = e -> atualizarPosFinal();
-        ((SpinnerNumberModel) spnTamanho.getModel()).addChangeListener(posListener);
-        ((SpinnerNumberModel) spnPosInicial.getModel()).addChangeListener(posListener);
-    }
-
-    private interface ChangeListener extends javax.swing.event.ChangeListener {
-        void stateChanged(javax.swing.event.ChangeEvent e);
-    }
 
     private void atualizarPosFinal() {
         if (atualizandoDetalhes) return;
@@ -310,23 +285,22 @@ public class CamposEntradaPanel extends JPanel {
     private void preencherDetalhes(CampoEntrada campo) {
         atualizandoDetalhes = true;
         try {
-            cmbEntrada.setSelectedItem(campo.getEntrada().isBlank() ? "S" : campo.getEntrada());
+            cmbEntrada.setSelectedItem(campo.getEntrada().trim().isEmpty() ? "S" : campo.getEntrada());
             txtNome.setText(campo.getNomeCampo());
             txtDescricao.setText(campo.getDescricaoCampo());
-            cmbTipo.setSelectedItem(campo.getTipoCampo().isBlank() ? "TEXTO" : campo.getTipoCampo());
+            cmbTipo.setSelectedItem(campo.getTipoCampo().trim().isEmpty() ? "TEXTO" : campo.getTipoCampo());
 
             int tamanho = campo.getTamanhoCampo() != null ? campo.getTamanhoCampo() : 1;
             int posInicial = campo.getPosicaoInicial() != null ? campo.getPosicaoInicial() : 1;
 
-            ((SpinnerNumberModel) spnTamanho.getModel()).setValue(tamanho);
-            ((SpinnerNumberModel) spnPosInicial.getModel()).setValue(posInicial);
+            spnTamanho.setValue(tamanho);
+            spnPosInicial.setValue(posInicial);
             txtPosFinal.setText(String.valueOf(posInicial + tamanho - 1));
 
-            String alin = campo.getAlinhamentoCampo().isBlank() ? "" : campo.getAlinhamentoCampo();
-            cmbAlinhamento.setSelectedItem(alin);
-
-            String obrig = campo.getCampoObrigatorio().isBlank() ? "" : campo.getCampoObrigatorio();
-            cmbObrigatorio.setSelectedItem(obrig);
+            cmbAlinhamento.setSelectedItem(campo.getAlinhamentoCampo().trim().isEmpty()
+                    ? "" : campo.getAlinhamentoCampo());
+            cmbObrigatorio.setSelectedItem(campo.getCampoObrigatorio().trim().isEmpty()
+                    ? "" : campo.getCampoObrigatorio());
 
             txtValorPadrao.setText(campo.getValorPadrao());
             txtValorUsuario.setText(campo.getValorUsuario());
@@ -366,7 +340,6 @@ public class CamposEntradaPanel extends JPanel {
         }
 
         CampoEntrada campo = tableModel.getCampo(linhaSelecionada);
-
         campo.setEntrada((String) cmbEntrada.getSelectedItem());
         campo.setNomeCampo(txtNome.getText().trim());
         campo.setDescricaoCampo(txtDescricao.getText().trim());
@@ -382,8 +355,8 @@ public class CamposEntradaPanel extends JPanel {
         tableModel.atualizarCampo(linhaSelecionada, campo);
 
         JOptionPane.showMessageDialog(this,
-                "Alterações aplicadas para o campo '" + campo.getNomeCampo() + "'.\n"
-                + "Clique em 'Atualizar Planilha' para salvar no arquivo Excel.",
+                "Alterações aplicadas para '" + campo.getNomeCampo() + "'.\n"
+                + "Clique em 'Atualizar Planilha' para salvar no Excel.",
                 "Alterações aplicadas", JOptionPane.INFORMATION_MESSAGE);
     }
 
@@ -393,12 +366,8 @@ public class CamposEntradaPanel extends JPanel {
 
     private void aplicarFiltro() {
         String texto = filtroField.getText().trim();
-        if (texto.isBlank()) {
-            sorter.setRowFilter(null);
-            return;
-        }
+        if (texto.isEmpty()) { sorter.setRowFilter(null); return; }
         try {
-            // Busca nas colunas Nome (1) e Descrição (2)
             sorter.setRowFilter(RowFilter.regexFilter("(?i)" + texto, 1, 2));
         } catch (PatternSyntaxException e) {
             sorter.setRowFilter(null);
@@ -408,16 +377,12 @@ public class CamposEntradaPanel extends JPanel {
     private void validarCampos() {
         List<CampoEntrada> campos = tableModel.getCampos();
         if (campos.isEmpty()) {
-            JOptionPane.showMessageDialog(this, "Nenhum campo carregado para validar.",
+            JOptionPane.showMessageDialog(this, "Nenhum campo carregado.",
                     "Validação", JOptionPane.WARNING_MESSAGE);
             return;
         }
 
         ResultadoValidacao resultado = validacaoService.validar(campos);
-
-        Icon icon = resultado.isValido()
-                ? UIManager.getIcon("OptionPane.informationIcon")
-                : UIManager.getIcon("OptionPane.errorIcon");
 
         JTextArea textArea = new JTextArea(resultado.getRelatorio(), 20, 60);
         textArea.setEditable(false);
@@ -431,15 +396,14 @@ public class CamposEntradaPanel extends JPanel {
 
     private void recalcularPosicoes() {
         int opcao = JOptionPane.showConfirmDialog(this,
-                "Isso vai recalcular as posições iniciais e finais de TODOS os campos de entrada\n"
-                + "em ordem sequencial começando de 1. Deseja continuar?",
-                "Recalcular Posições", JOptionPane.YES_NO_OPTION, JOptionPane.QUESTION_MESSAGE);
-
+                "Isso vai recalcular posições iniciais e finais de todos os campos\n"
+                + "em sequência começando de 1. Deseja continuar?",
+                "Recalcular Posições", JOptionPane.YES_NO_OPTION);
         if (opcao == JOptionPane.YES_OPTION) {
             validacaoService.recalcularPosicoes(tableModel.getCampos());
             tableModel.fireTableDataChanged();
             JOptionPane.showMessageDialog(this,
-                    "Posições recalculadas com sucesso.\nClique em 'Atualizar Planilha' para salvar.",
+                    "Posições recalculadas. Clique em 'Atualizar Planilha' para salvar.",
                     "Recalcular Posições", JOptionPane.INFORMATION_MESSAGE);
         }
     }
@@ -456,15 +420,8 @@ public class CamposEntradaPanel extends JPanel {
         sorter.setRowFilter(null);
     }
 
-    public List<CampoEntrada> getCampos() {
-        return tableModel.getCampos();
-    }
+    public List<CampoEntrada> getCampos() { return tableModel.getCampos(); }
 
-    public void setOnAtualizarPlanilha(Runnable callback) {
-        this.onAtualizarPlanilha = callback;
-    }
-
-    public void setOnGerarXml(Runnable callback) {
-        this.onGerarXml = callback;
-    }
+    public void setOnAtualizarPlanilha(Runnable callback) { this.onAtualizarPlanilha = callback; }
+    public void setOnGerarXml(Runnable callback) { this.onGerarXml = callback; }
 }

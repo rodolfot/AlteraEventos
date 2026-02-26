@@ -10,20 +10,19 @@ import java.util.List;
 
 /**
  * Serviço responsável por ler e escrever dados da planilha Excel.
- * Suporta a aba "Campos Entrada" conforme especificação.
+ * Compatível com Java 8.
  *
  * Estrutura da aba "Campos Entrada":
  *   Linha 1: cabeçalhos de grupo
  *   Linha 2: cabeçalhos das colunas
- *   Linhas 3-5: campos internos do sistema (sem posição de layout)
+ *   Linhas 3-5: campos internos do sistema
  *   Linha 6+: campos de entrada do evento
  */
 public class PlanilhaService {
 
     public static final String SHEET_CAMPOS_ENTRADA = "Campos Entrada";
-    public static final String SHEET_CHAMADA = "Chamada";
 
-    // Índices das colunas na aba "Campos Entrada" (0-based)
+    // Índices das colunas (0-based)
     private static final int COL_ENTRADA            = 0;
     private static final int COL_PERSISTENCIA       = 1;
     private static final int COL_ENRIQUECIMENTO     = 2;
@@ -63,22 +62,24 @@ public class PlanilhaService {
     // Linha de início dos dados (0-based) = linha 6 da planilha
     private static final int DATA_START_ROW = 5;
 
-    // Arquivo carregado atualmente
     private File arquivoAtual;
 
-    /**
-     * Lê todos os campos de entrada da planilha Excel.
-     */
     public List<CampoEntrada> lerPlanilha(File arquivo) throws IOException {
         this.arquivoAtual = arquivo;
         List<CampoEntrada> campos = new ArrayList<>();
 
-        try (FileInputStream fis = new FileInputStream(arquivo);
-             Workbook workbook = WorkbookFactory.create(fis)) {
+        FileInputStream fis = new FileInputStream(arquivo);
+        Workbook workbook;
+        try {
+            workbook = WorkbookFactory.create(fis);
+        } finally {
+            fis.close();
+        }
 
+        try {
             Sheet sheet = workbook.getSheet(SHEET_CAMPOS_ENTRADA);
             if (sheet == null) {
-                throw new IOException("Aba '" + SHEET_CAMPOS_ENTRADA + "' não encontrada na planilha.\n"
+                throw new IOException("Aba '" + SHEET_CAMPOS_ENTRADA + "' não encontrada.\n"
                         + "Abas disponíveis: " + obterNomesAbas(workbook));
             }
 
@@ -89,10 +90,10 @@ public class PlanilhaService {
                 if (row == null) continue;
 
                 String nomeCampo = getCellString(row, COL_NOME_CAMPO, evaluator);
-                if (nomeCampo.isBlank()) continue;
+                if (nomeCampo.trim().isEmpty()) continue;
 
                 CampoEntrada campo = new CampoEntrada();
-                campo.setLinha(rowIdx + 1); // converte para 1-based
+                campo.setLinha(rowIdx + 1);
 
                 campo.setEntrada(getCellString(row, COL_ENTRADA, evaluator));
                 campo.setPersistencia(getCellString(row, COL_PERSISTENCIA, evaluator));
@@ -130,27 +131,26 @@ public class PlanilhaService {
                 campo.setModelAttribute(getCellString(row, COL_MODEL_ATTRIBUTE, evaluator));
                 campo.setScoreModelIn(getCellString(row, COL_SCORE_MODEL_IN, evaluator));
 
-                // Pré-preenche o valor com o valor padrão
-                String valorInicial = campo.getValorPadrao().isBlank()
-                        ? campo.getDefaultValue()
-                        : campo.getValorPadrao();
+                String valorInicial = campo.getValorPadrao().trim().isEmpty()
+                        ? campo.getDefaultValue() : campo.getValorPadrao();
                 campo.setValorUsuario(valorInicial);
 
                 campos.add(campo);
             }
+        } finally {
+            workbook.close();
         }
 
         return campos;
     }
 
-    /**
-     * Salva as alterações da lista de campos de volta na planilha.
-     * Preserva fórmulas existentes (como PosicaoFinal) e estilos.
-     */
     public void salvarPlanilha(File arquivo, List<CampoEntrada> campos) throws IOException {
         Workbook workbook;
-        try (FileInputStream fis = new FileInputStream(arquivo)) {
+        FileInputStream fis = new FileInputStream(arquivo);
+        try {
             workbook = WorkbookFactory.create(fis);
+        } finally {
+            fis.close();
         }
 
         Sheet sheet = workbook.getSheet(SHEET_CAMPOS_ENTRADA);
@@ -160,7 +160,7 @@ public class PlanilhaService {
         }
 
         for (CampoEntrada campo : campos) {
-            int rowIdx = campo.getLinha() - 1; // converte para 0-based
+            int rowIdx = campo.getLinha() - 1;
             Row row = sheet.getRow(rowIdx);
             if (row == null) {
                 row = sheet.createRow(rowIdx);
@@ -185,62 +185,19 @@ public class PlanilhaService {
             }
         }
 
-        try (FileOutputStream fos = new FileOutputStream(arquivo)) {
+        FileOutputStream fos = new FileOutputStream(arquivo);
+        try {
             workbook.write(fos);
-        }
-        workbook.close();
-    }
-
-    /**
-     * Adiciona uma nova linha de campo na planilha.
-     */
-    public void adicionarCampo(File arquivo, CampoEntrada campo) throws IOException {
-        Workbook workbook;
-        try (FileInputStream fis = new FileInputStream(arquivo)) {
-            workbook = WorkbookFactory.create(fis);
-        }
-
-        Sheet sheet = workbook.getSheet(SHEET_CAMPOS_ENTRADA);
-        if (sheet == null) {
+        } finally {
+            fos.close();
             workbook.close();
-            throw new IOException("Aba '" + SHEET_CAMPOS_ENTRADA + "' não encontrada.");
         }
-
-        // Encontra próxima linha disponível
-        int nextRow = sheet.getLastRowNum() + 1;
-        Row row = sheet.createRow(nextRow);
-        campo.setLinha(nextRow + 1);
-
-        setCellString(row, COL_ENTRADA, campo.getEntrada());
-        setCellString(row, COL_NOME_CAMPO, campo.getNomeCampo());
-        setCellString(row, COL_DESCRICAO, campo.getDescricaoCampo());
-        setCellString(row, COL_TIPO, campo.getTipoCampo());
-        setCellString(row, COL_ALINHAMENTO, campo.getAlinhamentoCampo());
-        setCellString(row, COL_OBRIGATORIO, campo.getCampoObrigatorio());
-        setCellString(row, COL_VALOR_PADRAO, campo.getValorPadrao());
-
-        if (campo.getTamanhoCampo() != null) {
-            setCellNumeric(row, COL_TAMANHO, campo.getTamanhoCampo());
-        }
-        if (campo.getPosicaoInicial() != null) {
-            setCellNumeric(row, COL_POS_INICIAL, campo.getPosicaoInicial());
-            // Adiciona fórmula para PosicaoFinal
-            Cell cellPosFinal = row.createCell(COL_POS_FINAL, CellType.FORMULA);
-            cellPosFinal.setCellFormula(
-                    "L" + (nextRow + 1) + "+K" + (nextRow + 1) + "-1"
-            );
-        }
-
-        try (FileOutputStream fos = new FileOutputStream(arquivo)) {
-            workbook.write(fos);
-        }
-        workbook.close();
     }
 
     public File getArquivoAtual() { return arquivoAtual; }
 
     // =========================================================
-    // Métodos auxiliares de leitura de células
+    // Auxiliares de leitura
     // =========================================================
 
     private String getCellString(Row row, int colIdx, FormulaEvaluator evaluator) {
@@ -249,24 +206,22 @@ public class PlanilhaService {
         try {
             CellValue cv = evaluator.evaluate(cell);
             if (cv == null) return "";
-            return switch (cv.getCellType()) {
-                case STRING -> cv.getStringValue().trim();
-                case NUMERIC -> {
+            switch (cv.getCellType()) {
+                case STRING:
+                    return cv.getStringValue().trim();
+                case NUMERIC:
                     double d = cv.getNumberValue();
-                    yield (d == Math.floor(d) && !Double.isInfinite(d))
-                            ? String.valueOf((long) d)
-                            : String.valueOf(d);
-                }
-                case BOOLEAN -> String.valueOf(cv.getBooleanValue());
-                default -> "";
-            };
-        } catch (Exception e) {
-            // Fallback: lê como string diretamente
-            try {
-                return cell.getStringCellValue().trim();
-            } catch (Exception ex) {
-                return "";
+                    if (d == Math.floor(d) && !Double.isInfinite(d)) {
+                        return String.valueOf((long) d);
+                    }
+                    return String.valueOf(d);
+                case BOOLEAN:
+                    return String.valueOf(cv.getBooleanValue());
+                default:
+                    return "";
             }
+        } catch (Exception e) {
+            try { return cell.getStringCellValue().trim(); } catch (Exception ex) { return ""; }
         }
     }
 
@@ -276,21 +231,23 @@ public class PlanilhaService {
         try {
             CellValue cv = evaluator.evaluate(cell);
             if (cv == null) return null;
-            return switch (cv.getCellType()) {
-                case NUMERIC -> (int) cv.getNumberValue();
-                case STRING -> {
+            switch (cv.getCellType()) {
+                case NUMERIC:
+                    return (int) cv.getNumberValue();
+                case STRING:
                     String s = cv.getStringValue().trim();
-                    yield s.isBlank() ? null : Integer.parseInt(s);
-                }
-                default -> null;
-            };
+                    if (s.isEmpty()) return null;
+                    try { return Integer.parseInt(s); } catch (NumberFormatException ex) { return null; }
+                default:
+                    return null;
+            }
         } catch (Exception e) {
             return null;
         }
     }
 
     // =========================================================
-    // Métodos auxiliares de escrita de células
+    // Auxiliares de escrita
     // =========================================================
 
     private void setCellString(Row row, int colIdx, String value) {
@@ -298,8 +255,7 @@ public class PlanilhaService {
         if (cell == null) {
             cell = row.createCell(colIdx, CellType.STRING);
         } else if (cell.getCellType() == CellType.FORMULA) {
-            // Não sobrescreve fórmulas
-            return;
+            return; // preserva fórmulas
         }
         cell.setCellValue(value != null ? value : "");
     }
