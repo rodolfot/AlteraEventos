@@ -20,6 +20,8 @@ import csv
 import os
 import re
 import threading
+import html
+import unicodedata
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -510,6 +512,400 @@ def construir_xml(campos, headers=None, nome_aba="", sections=None):
 
     raw_xml = ET.tostring(root_el, encoding="unicode")
     return minidom.parseString(raw_xml).toprettyxml(indent="\t")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Geradores XML específicos (LayoutPersistencia, MapaAtributo, Enriquecimento)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _norm_aba(nome):
+    """Normaliza nome de aba removendo acentos, espaços e convertendo para minúsculas."""
+    texto = unicodedata.normalize("NFKD", str(nome or ""))
+    texto = "".join(c for c in texto if unicodedata.category(c) != "Mn")
+    return re.sub(r"[\s_\-]", "", texto).lower()
+
+
+def _raw_flag(raw, *keys):
+    """Retorna True se alguma das chaves (tolerando acentos) tiver valor 'S' no dict raw."""
+    raw_norm = {_norm_aba(k): v for k, v in raw.items()}
+    for k in keys:
+        if str(raw_norm.get(_norm_aba(k), "")).strip().upper() == "S":
+            return True
+    return False
+
+
+def _aba_campos_entrada(dados_por_aba):
+    """Retorna a lista de campos da aba 'Campos Entrada'."""
+    for nome, info in dados_por_aba.items():
+        if _norm_aba(nome) in ("camposentrada", "camposdeentrada"):
+            return info.get("campos", [])
+    if dados_por_aba:
+        return next(iter(dados_por_aba.values())).get("campos", [])
+    return []
+
+
+def _ler_identificacao_evento(filepath):
+    """
+    Lê a aba 'Identificação Evento' diretamente do xlsx.
+    Retorna dict {header: valor} da primeira linha de dados.
+    """
+    try:
+        wb = openpyxl.load_workbook(filepath, data_only=True)
+        sheet = None
+        for name in wb.sheetnames:
+            n = _norm_aba(name)
+            if "identificacaoevento" in n or "identificaevento" in n:
+                sheet = wb[name]
+                break
+        if sheet is None:
+            return {}
+        header_row = _detectar_linha_cabecalho(sheet)
+        headers_map = {}
+        for cell in sheet[header_row]:
+            if cell.value:
+                headers_map[cell.column] = str(cell.value).strip()
+        for row_idx in range(header_row + 1, min(header_row + 5, sheet.max_row + 1)):
+            row = sheet[row_idx]
+            result = {}
+            for cell in row:
+                if cell.column in headers_map and cell.value is not None:
+                    result[headers_map[cell.column]] = _cell_str(cell.value)
+            if result:
+                return result
+    except Exception:
+        pass
+    return {}
+
+
+def _ler_rule_attribute_valores(filepath):
+    """
+    Lê a aba 'Rule Attribute Valor Padrão' do xlsx.
+    Retorna lista de dicts com as colunas da aba (dataType, value, pattern etc.).
+    """
+    try:
+        wb = openpyxl.load_workbook(filepath, data_only=True)
+        sheet = None
+        for name in wb.sheetnames:
+            n = _norm_aba(name)
+            if "ruleattribute" in n and "valor" in n:
+                sheet = wb[name]
+                break
+        if sheet is None:
+            return []
+        headers_map = {}
+        for cell in sheet[1]:
+            if cell.value:
+                headers_map[cell.column] = str(cell.value).strip()
+        result = []
+        for row_idx in range(2, sheet.max_row + 1):
+            row = sheet[row_idx]
+            item = {}
+            for cell in row:
+                if cell.column in headers_map and cell.value is not None:
+                    item[headers_map[cell.column]] = _cell_str(cell.value)
+            if item:
+                result.append(item)
+        return result
+    except Exception:
+        pass
+    return []
+
+
+def construir_xml_persistencia(dados_por_aba, filepath=None):
+    """
+    Gera XML LayoutPersistencia a partir dos campos com Persistência=S.
+    Metadados de cabeçalho (Identificador, TamanhoLayout, IdentificadorEvento)
+    lidos da aba 'Identificação Evento' diretamente do xlsx.
+
+    Estrutura:
+      <LayoutPersistencia>
+        <Identificador>...</Identificador>
+        <TamanhoLayout>...</TamanhoLayout>
+        <IdentificadorEvento>...</IdentificadorEvento>
+        <Campos>
+          <CampoPersistencia>
+            <NomeTabela>...</NomeTabela>
+            <NomeColuna>...</NomeColuna>
+            <ValorPadrao>...</ValorPadrao>   ← apenas se não vazio
+            <AlinhamentoCampo>...</AlinhamentoCampo>
+            <IdentificadorCampo>...</IdentificadorCampo>
+            <NomeCampo>...</NomeCampo>
+            <DescricaoCampo>...</DescricaoCampo>
+            <TipoCampo>...</TipoCampo>
+            <CampoObrigatorio>...</CampoObrigatorio>
+            <TamanhoCampo>...</TamanhoCampo>  ← apenas se não vazio
+          </CampoPersistencia>
+        </Campos>
+      </LayoutPersistencia>
+    """
+    campos_entrada = _aba_campos_entrada(dados_por_aba)
+    campos_pers = [
+        c for c in campos_entrada
+        if _raw_flag(c.get("_raw", {}), "Persistência", "Persistencia")
+    ]
+
+    id_evento = _ler_identificacao_evento(filepath) if filepath else {}
+    id_norm = {_norm_aba(k): v for k, v in id_evento.items()}
+
+    root_el = ET.Element("LayoutPersistencia")
+
+    identificador = id_norm.get("identificador", "")
+    if identificador:
+        ET.SubElement(root_el, "Identificador").text = identificador
+    tamanho_layout = id_norm.get("tamanholayout", "")
+    if tamanho_layout:
+        ET.SubElement(root_el, "TamanhoLayout").text = tamanho_layout
+    id_evento_val = id_norm.get("identificadorevento", "")
+    if id_evento_val:
+        ET.SubElement(root_el, "IdentificadorEvento").text = id_evento_val
+
+    campos_el = ET.SubElement(root_el, "Campos")
+
+    for c in campos_pers:
+        raw = c.get("_raw", {})
+        rn  = {_norm_aba(k): v for k, v in raw.items()}
+        item = ET.SubElement(campos_el, "CampoPersistencia")
+
+        def _add(tag, *keys):
+            for k in keys:
+                val = rn.get(_norm_aba(k), "")
+                if val:
+                    ET.SubElement(item, tag).text = str(val)
+                    return
+
+        _add("NomeTabela",       "NomeTabela")
+        _add("NomeColuna",       "NomeColuna")
+
+        # ValorPadrao apenas se não vazio
+        vp = rn.get("valorpadrao", "") or c.get("valor_padrao", "")
+        if vp:
+            ET.SubElement(item, "ValorPadrao").text = vp
+
+        _add("AlinhamentoCampo", "AlinhamentoCampo", "Alinhamento")
+        _add("IdentificadorCampo", "IdentificadorCampo")
+        _add("NomeCampo",        "NomeCampo")
+        _add("DescricaoCampo",   "DescricaoCampo", "Descricao")
+        _add("TipoCampo",        "TipoCampo", "Tipo")
+        _add("CampoObrigatorio", "CampoObrigatorio", "Obrigatorio")
+
+        # TamanhoCampo apenas se não vazio
+        tam = rn.get("tamanhocampo", "") or (str(c["tamanho"]) if c.get("tamanho") else "")
+        if tam:
+            ET.SubElement(item, "TamanhoCampo").text = tam
+
+    raw_xml = ET.tostring(root_el, encoding="unicode")
+    return minidom.parseString(raw_xml).toprettyxml(indent="\t")
+
+
+def construir_xml_mapa_atributo(dados_por_aba, filepath=None):
+    """
+    Gera XML attributeMap (namespace ns2) a partir dos campos com MapaAtributo=S.
+    defaultValueDefinition lido da aba 'Rule Attribute Valor Padrão'.
+
+    Estrutura:
+      <ns2:attributeMap xmlns:ns2="http://rule.saf.cpqd.com.br/">
+        <defaultValueDefinition>
+          <defaultValueItem dataType="..." pattern="..." value="..."/>
+        </defaultValueDefinition>
+        <input>
+          <origin name="ENRICHMENT">
+            <attribute>
+              <eventAttribute name="..." type="..."/>
+              <ruleAttribute name="..." type="..."/>
+              <description>...</description>
+              <documentation>...</documentation>
+            </attribute>
+          </origin>
+        </input>
+      </ns2:attributeMap>
+    """
+    NS = "http://rule.saf.cpqd.com.br/"
+    ET.register_namespace("ns2", NS)
+
+    campos_entrada = _aba_campos_entrada(dados_por_aba)
+    campos_mapa = [
+        c for c in campos_entrada
+        if _raw_flag(c.get("_raw", {}), "MapaAtributo")
+    ]
+
+    default_values = _ler_rule_attribute_valores(filepath) if filepath else []
+
+    root_el = ET.Element(f"{{{NS}}}attributeMap")
+
+    # defaultValueDefinition
+    dv_el = ET.SubElement(root_el, "defaultValueDefinition")
+    for dv in default_values:
+        dv_n = {_norm_aba(k): v for k, v in dv.items()}
+        attribs = {}
+        for src_key, xml_key in [("datatype", "dataType"), ("pattern", "pattern"), ("value", "value")]:
+            val = dv_n.get(src_key, "")
+            if val:
+                attribs[xml_key] = val
+        if attribs:
+            ET.SubElement(dv_el, "defaultValueItem", attribs)
+
+    # input → agrupado por Origin
+    input_el = ET.SubElement(root_el, "input")
+    origins = {}
+    for c in campos_mapa:
+        raw = c.get("_raw", {})
+        rn  = {_norm_aba(k): v for k, v in raw.items()}
+        origin = rn.get("origin", "") or rn.get("origem", "") or "UNKNOWN"
+        origins.setdefault(origin, []).append(c)
+
+    for origin_name, origin_campos in origins.items():
+        origin_el = ET.SubElement(input_el, "origin", {"name": origin_name})
+        for c in origin_campos:
+            raw = c.get("_raw", {})
+            rn  = {_norm_aba(k): v for k, v in raw.items()}
+            attr_el = ET.SubElement(origin_el, "attribute")
+
+            event_attr = rn.get("eventattribute", "") or c.get("nome", "")
+            rule_attr  = rn.get("ruleattribute",  "") or c.get("nome", "")
+            type_val   = rn.get("type", "") or "STRING"
+            desc       = (rn.get("description", "")
+                          or rn.get("descricaocampo", "")
+                          or c.get("descricao", ""))
+            doc        = rn.get("documentation", "") or desc
+
+            ea = ET.SubElement(attr_el, "eventAttribute")
+            ea.set("name", event_attr)
+            ea.set("type", type_val)
+            ra = ET.SubElement(attr_el, "ruleAttribute")
+            ra.set("name", rule_attr)
+            ra.set("type", type_val)
+            ET.SubElement(attr_el, "description").text  = desc
+            ET.SubElement(attr_el, "documentation").text = doc
+
+    raw_xml = ET.tostring(root_el, encoding="unicode")
+    return minidom.parseString(raw_xml).toprettyxml(indent="\t")
+
+
+def construir_xml_enriquecimento(dados_por_aba):
+    """
+    Gera XML DadoExterno (Enriquecimento) a partir das abas:
+      'Enriquecimento', 'Enr_ChaveAcesso', 'Enr_CampoRetornado'.
+    CDATA é aplicado nos elementos ComandoSQL e SQLChave.
+
+    Estrutura:
+      <DadoExterno>
+        <Metrica ligado="S" modo="JMX"/>
+        <DadoAcesso>
+          <ComandoSQL><![CDATA[...]]></ComandoSQL>
+          ...
+          <GrupoChave><ChaveAcesso>...</ChaveAcesso></GrupoChave>
+          ...
+          <CampoRetornado>...</CampoRetornado>
+        </DadoAcesso>
+      </DadoExterno>
+    """
+    def _find_campos(patts):
+        for nome, info in dados_por_aba.items():
+            n = _norm_aba(nome)
+            for p in patts:
+                if n == p or n.endswith(p):
+                    return info.get("campos", [])
+        return []
+
+    enr_campos   = _find_campos(["enriquecimento"])
+    chave_campos = _find_campos(["enrchaveacesso", "chaveacesso"])
+    camp_campos  = _find_campos(["enrcamporetornado", "camporetornado"])
+
+    # Indexa por valor da coluna "Nome" (chave de ligação)
+    chaves_por_nome = {}
+    for c in chave_campos:
+        rn = {_norm_aba(k): v for k, v in c.get("_raw", {}).items()}
+        nome = rn.get("nome", "") or c.get("nome", "")
+        chaves_por_nome.setdefault(nome, []).append(rn)
+
+    retornados_por_nome = {}
+    for c in camp_campos:
+        rn = {_norm_aba(k): v for k, v in c.get("_raw", {}).items()}
+        nome = rn.get("nome", "") or c.get("nome", "")
+        retornados_por_nome.setdefault(nome, []).append(rn)
+
+    root_el = ET.Element("DadoExterno")
+    ET.SubElement(root_el, "Metrica", {"ligado": "S", "modo": "JMX"})
+
+    def _te(parent, tag, val):
+        if val:
+            ET.SubElement(parent, tag).text = str(val)
+
+    for c in enr_campos:
+        rn   = {_norm_aba(k): v for k, v in c.get("_raw", {}).items()}
+        nome = rn.get("nome", "") or c.get("nome", "")
+        da   = ET.SubElement(root_el, "DadoAcesso")
+
+        # ComandoSQL — CDATA aplicado pós-geração
+        ET.SubElement(da, "ComandoSQL").text = rn.get("comandosql", "")
+
+        _te(da, "Nome",        nome)
+        _te(da, "Descricao",   rn.get("descricao", "") or c.get("descricao", ""))
+        _te(da, "TamanhoTransacao", rn.get("tamanhotransacao", ""))
+        _te(da, "PersistirEnriquecimento",
+            rn.get("persistirenriquecimento", "") or "S")
+        _te(da, "PermiteAtualizarSeExistirCache",
+            rn.get("permiteatualizarseexistircache", "") or "N")
+        _te(da, "OrigemEnriquecimento",
+            rn.get("origemenriquecimento", "") or "BD")
+
+        # SQLChave — CDATA aplicado pós-geração
+        ET.SubElement(da, "SQLChave").text = rn.get("sqlchave", "")
+
+        # GrupoChave
+        grupo = ET.SubElement(da, "GrupoChave")
+        for chave_n in chaves_por_nome.get(nome, []):
+            chave_el = ET.SubElement(grupo, "ChaveAcesso")
+            _te(chave_el, "Identificador",  chave_n.get("identificador", ""))
+            _te(chave_el, "ConversorChave", chave_n.get("conversorchave", ""))
+            _te(chave_el, "PosInicial",
+                chave_n.get("posinicial", "") or chave_n.get("posicaoinicial", ""))
+            _te(chave_el, "PosFinal",
+                chave_n.get("posfinal", "") or chave_n.get("posicaofinal", ""))
+
+        _te(da, "DataSource", rn.get("datasource", ""))
+        _te(da, "PermiteAtualizarCache",
+            rn.get("permiteatualizarcache", "") or "N")
+
+        # CampoRetornado
+        for cr_n in retornados_por_nome.get(nome, []):
+            cr = ET.SubElement(da, "CampoRetornado")
+            _te(cr, "AliasCampo", cr_n.get("aliascampo", ""))
+
+            # CampoDestino: sempre presente; auto-fechado se vazio
+            cd = ET.SubElement(cr, "CampoDestino")
+            v = cr_n.get("campodestino", "")
+            if v:
+                cd.text = v
+
+            _te(cr, "NomeCampo", cr_n.get("nomecampo", ""))
+            _te(cr, "TipoCampo", cr_n.get("tipocampo", ""))
+
+            # MascaraCampo: sempre presente; auto-fechado se vazio
+            mc = ET.SubElement(cr, "MascaraCampo")
+            v = cr_n.get("mascaracampo", "")
+            if v:
+                mc.text = v
+
+            _te(cr, "PosInicial",
+                cr_n.get("posinicial", "") or cr_n.get("posicaoinicial", ""))
+            _te(cr, "PosFinal",
+                cr_n.get("posfinal", "") or cr_n.get("posicaofinal", ""))
+            _te(cr, "MapaDestino", cr_n.get("mapadestino", ""))
+
+    raw_xml = ET.tostring(root_el, encoding="unicode")
+    pretty  = minidom.parseString(raw_xml).toprettyxml(indent="\t")
+
+    # Envolve ComandoSQL e SQLChave em CDATA
+    def _to_cdata(xml_text, tag):
+        def repl(m):
+            content = html.unescape(m.group(1))
+            return f"<{tag}><![CDATA[{content}]]></{tag}>"
+        return re.sub(rf"<{tag}>(.*?)</{tag}>", repl, xml_text, flags=re.DOTALL)
+
+    pretty = _to_cdata(pretty, "ComandoSQL")
+    pretty = _to_cdata(pretty, "SQLChave")
+    return pretty
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1010,7 +1406,7 @@ class GeradorXMLApp:
         m_fer.add_command(label="Validar Soma  F5",               command=self.validar)
         m_fer.add_command(label="Recalcular Posições",            command=self.recalcular_posicoes)
         m_fer.add_separator()
-        m_fer.add_command(label="Gerar XML  F6",                  command=self.gerar_xml)
+        m_fer.add_command(label="Gerar XMLs (todos)  F6",         command=self.gerar_xml)
         m_fer.add_command(label="Pré-visualizar XML  F7",         command=self.preview_xml)
         mb.add_cascade(label="Ferramentas", menu=m_fer)
 
@@ -1061,7 +1457,7 @@ class GeradorXMLApp:
         fra = tk.Frame(bar, bg=COR_TOOLBAR)
         fra.pack(side=tk.RIGHT, padx=8)
 
-        self._btn(fra, "📄 Gerar XML [F6]",        self.gerar_xml,         COR_BTN_ROXO,  side=tk.RIGHT, padx=2)
+        self._btn(fra, "📄 Gerar XMLs [F6]",       self.gerar_xml,         COR_BTN_ROXO,  side=tk.RIGHT, padx=2)
         self._btn(fra, "👁 Preview XML [F7]",      self.preview_xml,       COR_BTN_CINZA, side=tk.RIGHT, padx=2)
         self._btn(fra, "✔ Validar [F5]",           self.validar,           COR_BTN_CINZA, side=tk.RIGHT, padx=2)
         self._btn(fra, "💾 Salvar Planilha",        self.salvar_planilha,   COR_BTN_TEAL,  side=tk.RIGHT, padx=2)
@@ -1695,54 +2091,108 @@ class GeradorXMLApp:
             messagebox.showerror("Erro ao gerar XML", str(e))
 
     def gerar_xml(self):
-        if not self._campos:
+        if not self._dados_por_aba:
             messagebox.showwarning("Aviso", "Carregue uma planilha primeiro.")
             return
 
-        erros, _, _ = validar_campos(self._campos)
+        # Usa "Campos Entrada" como referência para validação
+        aba_entrada = None
+        for nome, info in self._dados_por_aba.items():
+            if _norm_aba(nome) == "camposentrada":
+                aba_entrada = info
+                break
+        if aba_entrada is None and self._dados_por_aba:
+            aba_entrada = next(iter(self._dados_por_aba.values()))
+
+        campos_validar = aba_entrada.get("campos", []) if aba_entrada else self._campos
+        erros, _, _ = validar_campos(campos_validar)
         if erros:
             if not messagebox.askyesno("Validação com erros",
-                    f"Existem {len(erros)} erro(s) de validação.\nDeseja gerar o XML mesmo assim?"):
+                    f"Existem {len(erros)} erro(s) de validação.\n"
+                    "Deseja gerar os XMLs mesmo assim?"):
                 return
 
-        sugerido = ""
-        if self._arquivo_principal:
-            nome_xml = _nome_xml_para_aba(self._aba_ativa) if self._aba_ativa else "XML"
-            dir_base = os.path.dirname(self._arquivo_principal)
-            sugerido = os.path.join(dir_base, nome_xml + ".xml")
-
-        path = filedialog.asksaveasfilename(
-            title="Salvar XML",
-            defaultextension=".xml",
-            filetypes=[("XML", "*.xml"), ("Todos", "*.*")],
-            initialfile=os.path.basename(sugerido) if sugerido else "evento.xml",
-            initialdir=os.path.dirname(sugerido) if sugerido else ""
+        # Pede diretório de saída
+        dir_inicial = os.path.dirname(self._arquivo_principal) if self._arquivo_principal else ""
+        dir_saida = filedialog.askdirectory(
+            title="Selecione o diretório para salvar os XMLs",
+            initialdir=dir_inicial
         )
-        if not path:
+        if not dir_saida:
             return
 
+        gerados      = []
+        erros_geracao = []
+
+        # 1. LayoutEntrada.xml
         try:
-            xml_str = construir_xml(self._campos, self._headers_ativos, self._aba_ativa, self._sections_ativos)
+            xml_str = construir_xml(
+                campos_validar,
+                aba_entrada.get("headers", [])  if aba_entrada else self._headers_ativos,
+                "Campos Entrada",
+                aba_entrada.get("sections", {}) if aba_entrada else self._sections_ativos,
+            )
+            path = os.path.join(dir_saida, "LayoutEntrada.xml")
             with open(path, "w", encoding="utf-8") as f:
                 f.write(xml_str)
-
-            # Atualiza preview
+            gerados.append("LayoutEntrada.xml")
+            # Atualiza preview com o LayoutEntrada
             self._txt_xml.configure(state=tk.NORMAL)
             self._txt_xml.delete(1.0, tk.END)
             self._txt_xml.insert(tk.END, xml_str)
             self._txt_xml.configure(state=tk.DISABLED)
             self._notebook.select(1)
-
-            ativos = [c for c in self._campos
-                      if (c.get("entrada","S") or "S").upper()=="S" and c.get("pos_ini")]
-            total = sum(c.get("tamanho", 0) or 0 for c in ativos)
-            self._set_status(
-                f"XML gerado: {os.path.basename(path)}  |  "
-                f"{len(ativos)} campos  |  {total} bytes"
-            )
-            messagebox.showinfo("Sucesso", f"XML gerado com sucesso!\n{path}")
         except Exception as e:
-            messagebox.showerror("Erro ao gerar XML", str(e))
+            erros_geracao.append(f"LayoutEntrada.xml: {e}")
+
+        # 2. LayoutPersistencia.xml
+        try:
+            xml_str = construir_xml_persistencia(
+                self._dados_por_aba, self._arquivo_principal
+            )
+            path = os.path.join(dir_saida, "LayoutPersistencia.xml")
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(xml_str)
+            gerados.append("LayoutPersistencia.xml")
+        except Exception as e:
+            erros_geracao.append(f"LayoutPersistencia.xml: {e}")
+
+        # 3. mapaAtributo.xml
+        try:
+            xml_str = construir_xml_mapa_atributo(
+                self._dados_por_aba, self._arquivo_principal
+            )
+            path = os.path.join(dir_saida, "mapaAtributo.xml")
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(xml_str)
+            gerados.append("mapaAtributo.xml")
+        except Exception as e:
+            erros_geracao.append(f"mapaAtributo.xml: {e}")
+
+        # 4. DadoExterno.xml (Enriquecimento)
+        try:
+            xml_str = construir_xml_enriquecimento(self._dados_por_aba)
+            path = os.path.join(dir_saida, "DadoExterno.xml")
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(xml_str)
+            gerados.append("DadoExterno.xml")
+        except Exception as e:
+            erros_geracao.append(f"DadoExterno.xml: {e}")
+
+        # Resultado
+        linhas_ok  = "\n".join(f"  ✔ {n}" for n in gerados)
+        linhas_err = "\n".join(f"  ✗ {e}" for e in erros_geracao)
+        msg = f"XMLs gerados em:\n{dir_saida}\n\n{linhas_ok}"
+        if erros_geracao:
+            msg += f"\n\nErros:\n{linhas_err}"
+            messagebox.showwarning("XMLs gerados com erros", msg)
+        else:
+            messagebox.showinfo("Sucesso", msg)
+
+        self._set_status(
+            f"{len(gerados)} XML(s) gerado(s) em: {os.path.basename(dir_saida)}"
+            + (f"  |  {len(erros_geracao)} erro(s)" if erros_geracao else "")
+        )
 
     # ── Utilidades ────────────────────────────────────────────────────────────
 
