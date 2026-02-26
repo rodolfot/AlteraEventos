@@ -111,9 +111,23 @@ def ler_campos_entrada(filepath):
 
 
 def _ler_campos_de_sheet(sheet):
-    """Lê campos de qualquer aba de planilha, detectando cabeçalho e colunas automaticamente."""
+    """
+    Lê campos de qualquer aba de planilha, detectando cabeçalho e colunas automaticamente.
+    Retorna (campos, headers) onde:
+      - campos: lista de dicts com chaves padrão + '_raw' (todos os valores pelo header original)
+      - headers: lista de nomes de colunas na ordem original da planilha
+    """
     header_row = _detectar_linha_cabecalho(sheet)
     col_map = _mapear_colunas(sheet, header_row)
+
+    # Cabeçalhos na ordem original da planilha
+    headers = []
+    col_para_header = {}
+    for cell in sheet[header_row]:
+        if cell.value:
+            h = str(cell.value).strip()
+            headers.append(h)
+            col_para_header[cell.column] = h
 
     campos = []
     for row_idx in range(header_row + 1, sheet.max_row + 1):
@@ -127,6 +141,12 @@ def _ler_campos_de_sheet(sheet):
         pos_ini = _cell_int(_get_col(row, col_map, "PosicaoInicial", "PosInicial", "PosIni"))
         pos_fin_lido = _cell_int(_get_col(row, col_map, "PosicaoFinal", "PosFinal", "PosFin"))
         pos_fin = (pos_ini + tamanho - 1) if (pos_ini and tamanho) else pos_fin_lido
+
+        # Todos os valores da linha pelo nome original do cabeçalho
+        raw = {}
+        for cell in row:
+            if cell.column in col_para_header:
+                raw[col_para_header[cell.column]] = _cell_str(cell.value)
 
         campo = {
             "linha":      row_idx,
@@ -144,10 +164,11 @@ def _ler_campos_de_sheet(sheet):
             "coluna_db":    _get_col(row, col_map, "NomeColuna", "Coluna_DB", "ColunaDB"),
             "oracle_type":  _get_col(row, col_map, "OracleDataType", "OracleType"),
             "valor":        _get_col(row, col_map, "ValorPadrao", "Valor_Padrao"),
+            "_raw":         raw,
         }
         campos.append(campo)
 
-    return campos
+    return campos, headers
 
 
 def _ler_xlsx_campos_entrada(filepath):
@@ -165,7 +186,8 @@ def _ler_xlsx_campos_entrada(filepath):
             f"Abas disponíveis: {', '.join(wb.sheetnames)}"
         )
 
-    return _ler_campos_de_sheet(sheet)
+    campos, _ = _ler_campos_de_sheet(sheet)
+    return campos
 
 
 def _ler_csv_campos_entrada(filepath):
@@ -205,14 +227,15 @@ def _ler_csv_campos_entrada(filepath):
 
 def ler_todas_abas(filepath):
     """
-    Lê todas as abas de um .xlsx como dicionário {nome_aba: [campos]}.
+    Lê todas as abas de um .xlsx como dicionário {nome_aba: {"campos": list, "headers": list}}.
     Para CSV, retorna uma única entrada 'Campos Entrada'.
     Abas sem campos reconhecidos são ignoradas.
     """
     ext = os.path.splitext(filepath)[1].lower()
 
     if ext == ".csv":
-        return {"Campos Entrada": _ler_csv_campos_entrada(filepath)}
+        campos = _ler_csv_campos_entrada(filepath)
+        return {"Campos Entrada": {"campos": campos, "headers": []}}
 
     wb = openpyxl.load_workbook(filepath, data_only=True)
     resultado = {}
@@ -220,9 +243,9 @@ def ler_todas_abas(filepath):
     for nome_aba in wb.sheetnames:
         ws = wb[nome_aba]
         try:
-            campos = _ler_campos_de_sheet(ws)
+            campos, headers = _ler_campos_de_sheet(ws)
             if campos:
-                resultado[nome_aba] = campos
+                resultado[nome_aba] = {"campos": campos, "headers": headers}
         except Exception:
             pass
 
@@ -320,8 +343,14 @@ def _aplicar_alinhamento(valor, tamanho, alinhamento, tipo):
     return valor + " " * diff
 
 
-def construir_xml(campos):
-    """Constrói string XML formatada a partir da lista de campos."""
+def construir_xml(campos, headers=None):
+    """
+    Constrói string XML formatada a partir da lista de campos.
+    Se 'headers' for fornecido, usa os nomes originais das colunas da aba como tags XML,
+    respeitando a ordem e as colunas próprias de cada aba.
+    """
+    _NOME_COLS = {"nomecampo", "nome", "campo", "fieldname"}
+
     ativos = sorted(
         [c for c in campos if (c.get("entrada", "S") or "S").upper() == "S" and c.get("pos_ini")],
         key=lambda c: c.get("pos_ini", 0)
@@ -337,37 +366,49 @@ def construir_xml(campos):
     for c in ativos:
         campo_el = ET.SubElement(campos_el, "campo")
 
-        def _sub(tag, val):
+        def _sub(tag, val, _el=campo_el):
+            tag_safe = _sanitizar_xml(tag)
             if val is not None and str(val).strip():
-                e = ET.SubElement(campo_el, tag)
+                e = ET.SubElement(_el, tag_safe)
                 e.text = str(val)
 
-        # Primeira linha: NomeCampo com o nome do campo
+        # Primeiro elemento: NomeCampo
         _sub("NomeCampo", c.get("nome", ""))
 
-        # Demais linhas: valor posicionado e metadados
+        # Segundo elemento: valor posicionado (calculado)
         valor = c.get("valor") or c.get("valor_padrao") or ""
         if c.get("tamanho"):
             valor = _aplicar_alinhamento(valor, c["tamanho"], c.get("alinhamento", ""), c.get("tipo", ""))
         _sub("valor", valor)
 
-        if c.get("id"):           _sub("id",             str(c["id"]))
-        _sub("tipo",               c.get("tipo") or "TEXTO")
-        if c.get("tamanho"):      _sub("tamanho",        str(c["tamanho"]))
-        if c.get("pos_ini"):      _sub("posicaoInicial", str(c["pos_ini"]))
+        if headers and "_raw" in c:
+            # Usa as colunas reais da aba, na ordem do cabeçalho original
+            raw = c["_raw"]
+            for header in headers:
+                if _normalizar_chave(header) in _NOME_COLS:
+                    continue  # NomeCampo já incluído acima
+                val = raw.get(header, "")
+                if val:
+                    _sub(header, val)
+        else:
+            # Fallback: colunas fixas (campos sem _raw ou sem headers)
+            if c.get("id"):           _sub("id",             str(c["id"]))
+            _sub("tipo",               c.get("tipo") or "TEXTO")
+            if c.get("tamanho"):      _sub("tamanho",        str(c["tamanho"]))
+            if c.get("pos_ini"):      _sub("posicaoInicial", str(c["pos_ini"]))
 
-        pos_fin = c.get("pos_fin")
-        if not pos_fin and c.get("pos_ini") and c.get("tamanho"):
-            pos_fin = c["pos_ini"] + c["tamanho"] - 1
-        if pos_fin:               _sub("posicaoFinal",   str(pos_fin))
+            pos_fin = c.get("pos_fin")
+            if not pos_fin and c.get("pos_ini") and c.get("tamanho"):
+                pos_fin = c["pos_ini"] + c["tamanho"] - 1
+            if pos_fin:               _sub("posicaoFinal",   str(pos_fin))
 
-        if c.get("alinhamento"):  _sub("alinhamento",    c["alinhamento"])
-        if c.get("obrigatorio"):  _sub("obrigatorio",    c["obrigatorio"])
-        if c.get("descricao"):    _sub("descricao",      c["descricao"])
-        if c.get("coluna_db"):    _sub("colunaDB",       c["coluna_db"])
+            if c.get("alinhamento"):  _sub("alinhamento",    c["alinhamento"])
+            if c.get("obrigatorio"):  _sub("obrigatorio",    c["obrigatorio"])
+            if c.get("descricao"):    _sub("descricao",      c["descricao"])
+            if c.get("coluna_db"):    _sub("colunaDB",       c["coluna_db"])
 
-    raw = ET.tostring(root, encoding="unicode")
-    return minidom.parseString(raw).toprettyxml(indent="    ")
+    raw_xml = ET.tostring(root, encoding="unicode")
+    return minidom.parseString(raw_xml).toprettyxml(indent="    ")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -719,9 +760,12 @@ class GeradorXMLApp:
         self.root.minsize(900, 600)
 
         self._campos: list = []             # campos da aba ativa
-        self._dados_por_aba: dict = {}      # nome_aba → list of campos
+        self._dados_por_aba: dict = {}      # nome_aba → {"campos": list, "headers": list}
         self._aba_ativa: str = ""           # aba atualmente exibida
-        self._origem: list = []             # campos da planilha origem
+        self._headers_ativos: list = []     # headers da aba ativa (ordem original da planilha)
+        self._origem: list = []             # campos da aba ativa da origem
+        self._dados_por_aba_origem: dict = {}  # nome_aba → {"campos": list, "headers": list}
+        self._aba_origem_ativa: str = ""    # aba selecionada na origem
         self._arquivo_principal = None
         self._arquivo_origem = None
         self._idx_editando = -1             # índice do campo sendo editado
@@ -811,6 +855,18 @@ class GeradorXMLApp:
         self._lbl_origem = tk.Label(fro, text="—", bg=COR_TOOLBAR,
                                     fg="#555", font=("Segoe UI", 8))
         self._lbl_origem.pack(side=tk.LEFT, padx=6)
+
+        # ── Aba origem ───────────────────────────────────────────────────────
+        fra_aba_orig = tk.LabelFrame(bar, text="Aba Origem", bg=COR_TOOLBAR,
+                                     font=FONT_NORMAL, padx=4, pady=2)
+        fra_aba_orig.pack(side=tk.LEFT, padx=4)
+
+        self._var_aba_origem = tk.StringVar()
+        self._combo_aba_origem = ttk.Combobox(fra_aba_orig, textvariable=self._var_aba_origem,
+                                              state="disabled", width=20, font=FONT_NORMAL)
+        self._combo_aba_origem.pack(side=tk.LEFT, padx=2, pady=1)
+        self._combo_aba_origem.bind("<<ComboboxSelected>>",
+                                    lambda _: self._mudar_aba_origem(self._var_aba_origem.get()))
 
         # ── Copiar campos ─────────────────────────────────────────────────────
         frc = tk.LabelFrame(bar, text="Copiar Campos da Origem", bg=COR_TOOLBAR,
@@ -1024,7 +1080,7 @@ class GeradorXMLApp:
 
             nome = os.path.basename(path)
             self._lbl_principal.config(text=nome, fg="#1565c0")
-            total = sum(len(v) for v in self._dados_por_aba.values())
+            total = sum(len(v["campos"]) for v in self._dados_por_aba.values())
             self._set_status(
                 f"Principal carregada: {nome}  —  {len(self._dados_por_aba)} aba(s), {total} campos"
             )
@@ -1038,33 +1094,56 @@ class GeradorXMLApp:
         )
         if not path:
             return
+
         try:
-            campos = ler_campos_entrada(path)
-        except Exception:
-            # Se não tem aba "Campos Entrada", tenta ler a primeira aba genericamente
+            dados = ler_todas_abas(path)
+        except Exception as e:
+            messagebox.showerror("Erro ao carregar origem", str(e))
+            return
+
+        if not dados:
+            # Fallback: lê a primeira aba genericamente
             try:
                 campos = self._ler_xlsx_generico(path)
+                dados = {os.path.splitext(os.path.basename(path))[0]: {"campos": campos, "headers": []}}
             except Exception as e:
                 messagebox.showerror("Erro ao carregar origem", str(e))
                 return
 
-        self._origem = campos
+        self._dados_por_aba_origem = dados
         self._arquivo_origem = path
-        nomes = [c.get("nome", "") for c in campos if c.get("nome")]
-        if nomes:
-            self._btn_copiar_origem.configure(state=tk.NORMAL)
+
+        nomes = list(dados.keys())
+        self._combo_aba_origem.configure(values=nomes, state="readonly")
+        self._var_aba_origem.set(nomes[0])
+        self._mudar_aba_origem(nomes[0])
 
         nome = os.path.basename(path)
         self._lbl_origem.config(text=nome, fg="#2e7d32")
-        self._set_status(f"Origem carregada: {nome}  —  {len(campos)} campos disponíveis")
+        n_abas = len(dados)
+        total = sum(len(v["campos"]) for v in dados.values())
+        self._set_status(
+            f"Origem carregada: {nome}  —  {n_abas} aba(s), {total} campos disponíveis"
+        )
 
     def _mudar_aba(self, nome_aba):
         """Troca a aba ativa e atualiza a tabela de campos."""
         self._aba_ativa = nome_aba
-        self._campos = self._dados_por_aba.get(nome_aba, [])
+        aba = self._dados_por_aba.get(nome_aba, {})
+        self._campos = aba.get("campos", [])
+        self._headers_ativos = aba.get("headers", [])
         self._atualizar_tabela()
         nome_xml = _nome_xml_para_aba(nome_aba)
         self._set_status(f"Aba: {nome_aba}  ({len(self._campos)} campos)  →  {nome_xml}")
+
+    def _mudar_aba_origem(self, nome_aba):
+        """Troca a aba ativa da planilha origem."""
+        self._aba_origem_ativa = nome_aba
+        aba = self._dados_por_aba_origem.get(nome_aba, {})
+        self._origem = aba.get("campos", [])
+        estado = tk.NORMAL if self._origem else tk.DISABLED
+        self._btn_copiar_origem.configure(state=estado)
+        self._set_status(f"Aba origem: {nome_aba}  ({len(self._origem)} campos disponíveis)")
 
     def _ler_xlsx_generico(self, path):
         """Lê a primeira aba como lista de campos, usando a 1ª linha como cabeçalho."""
@@ -1353,7 +1432,7 @@ class GeradorXMLApp:
             messagebox.showwarning("Aviso", "Carregue uma planilha primeiro.")
             return
         try:
-            xml_str = construir_xml(self._campos)
+            xml_str = construir_xml(self._campos, self._headers_ativos)
             self._txt_xml.configure(state=tk.NORMAL)
             self._txt_xml.delete(1.0, tk.END)
             self._txt_xml.insert(tk.END, xml_str)
@@ -1390,7 +1469,7 @@ class GeradorXMLApp:
             return
 
         try:
-            xml_str = construir_xml(self._campos)
+            xml_str = construir_xml(self._campos, self._headers_ativos)
             with open(path, "w", encoding="utf-8") as f:
                 f.write(xml_str)
 
