@@ -297,27 +297,36 @@ def construir_xml(campos):
     campos_el = ET.SubElement(root, "campos")
 
     for c in ativos:
-        el = ET.SubElement(campos_el, _sanitizar_xml(c.get("nome", "campo")))
+        campo_el = ET.SubElement(campos_el, "campo")
 
-        if c.get("id"):            el.set("id", str(c["id"]))
-        el.set("tipo", c.get("tipo") or "TEXTO")
-        if c.get("tamanho"):       el.set("tamanho", str(c["tamanho"]))
-        if c.get("pos_ini"):       el.set("posicaoInicial", str(c["pos_ini"]))
+        def _sub(tag, val):
+            if val is not None and str(val).strip():
+                e = ET.SubElement(campo_el, tag)
+                e.text = str(val)
+
+        # Primeira linha: NomeCampo com o nome do campo
+        _sub("NomeCampo", c.get("nome", ""))
+
+        # Demais linhas: valor posicionado e metadados
+        valor = c.get("valor") or c.get("valor_padrao") or ""
+        if c.get("tamanho"):
+            valor = _aplicar_alinhamento(valor, c["tamanho"], c.get("alinhamento", ""), c.get("tipo", ""))
+        _sub("valor", valor)
+
+        if c.get("id"):           _sub("id",             str(c["id"]))
+        _sub("tipo",               c.get("tipo") or "TEXTO")
+        if c.get("tamanho"):      _sub("tamanho",        str(c["tamanho"]))
+        if c.get("pos_ini"):      _sub("posicaoInicial", str(c["pos_ini"]))
 
         pos_fin = c.get("pos_fin")
         if not pos_fin and c.get("pos_ini") and c.get("tamanho"):
             pos_fin = c["pos_ini"] + c["tamanho"] - 1
-        if pos_fin:                el.set("posicaoFinal", str(pos_fin))
+        if pos_fin:               _sub("posicaoFinal",   str(pos_fin))
 
-        if c.get("alinhamento"):   el.set("alinhamento", c["alinhamento"])
-        if c.get("obrigatorio"):   el.set("obrigatorio", c["obrigatorio"])
-        if c.get("descricao"):     el.set("descricao", c["descricao"])
-        if c.get("coluna_db"):     el.set("colunaDB", c["coluna_db"])
-
-        valor = c.get("valor") or c.get("valor_padrao") or ""
-        if c.get("tamanho"):
-            valor = _aplicar_alinhamento(valor, c["tamanho"], c.get("alinhamento", ""), c.get("tipo", ""))
-        el.text = valor
+        if c.get("alinhamento"):  _sub("alinhamento",    c["alinhamento"])
+        if c.get("obrigatorio"):  _sub("obrigatorio",    c["obrigatorio"])
+        if c.get("descricao"):    _sub("descricao",      c["descricao"])
+        if c.get("coluna_db"):    _sub("colunaDB",       c["coluna_db"])
 
     raw = ET.tostring(root, encoding="unicode")
     return minidom.parseString(raw).toprettyxml(indent="    ")
@@ -530,6 +539,133 @@ class JanelaEditarCampo(tk.Toplevel):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Janela de seleção múltipla de campos da origem
+# ─────────────────────────────────────────────────────────────────────────────
+
+class JanelaCopiarCampos(tk.Toplevel):
+
+    def __init__(self, parent, campos_origem, on_confirmar=None):
+        super().__init__(parent)
+        self.title("Copiar Campos da Origem")
+        self.geometry("480x520")
+        self.resizable(True, True)
+        self.minsize(380, 380)
+        self.grab_set()
+        self.transient(parent)
+
+        self._campos = campos_origem
+        self._campos_filtrados = list(campos_origem)
+        self.on_confirmar = on_confirmar
+
+        self._build_ui()
+        self.wait_window(self)
+
+    def _build_ui(self):
+        frame = tk.Frame(self, bg=COR_BG, padx=10, pady=10)
+        frame.pack(fill=tk.BOTH, expand=True)
+
+        # Filtro
+        filt_frame = tk.Frame(frame, bg=COR_BG)
+        filt_frame.pack(fill=tk.X, pady=(0, 6))
+        tk.Label(filt_frame, text="🔍 Filtrar:", bg=COR_BG, font=FONT_NORMAL).pack(side=tk.LEFT)
+        self._var_filtro = tk.StringVar()
+        self._var_filtro.trace_add("write", lambda *_: self._filtrar())
+        tk.Entry(filt_frame, textvariable=self._var_filtro, font=FONT_NORMAL, width=28,
+                 relief=tk.FLAT, highlightthickness=1,
+                 highlightbackground="#bbb").pack(side=tk.LEFT, padx=4)
+        tk.Button(filt_frame, text="✕", command=lambda: self._var_filtro.set(""),
+                  bg="#ddd", relief=tk.FLAT, font=FONT_NORMAL).pack(side=tk.LEFT)
+
+        # Instrução
+        tk.Label(frame, text="Selecione os campos (Ctrl+Click ou Shift+Click para múltiplos):",
+                 bg=COR_BG, font=FONT_NORMAL, anchor=tk.W).pack(fill=tk.X, pady=(0, 4))
+
+        # Listbox
+        list_frame = tk.Frame(frame, bg=COR_BG)
+        list_frame.pack(fill=tk.BOTH, expand=True)
+
+        self._listbox = tk.Listbox(list_frame, selectmode=tk.EXTENDED,
+                                   font=FONT_NORMAL, activestyle="dotbox",
+                                   exportselection=False, relief=tk.FLAT,
+                                   highlightthickness=1, highlightbackground="#bbb")
+        vsb = ttk.Scrollbar(list_frame, orient=tk.VERTICAL, command=self._listbox.yview)
+        self._listbox.configure(yscrollcommand=vsb.set)
+        self._listbox.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        vsb.pack(side=tk.RIGHT, fill=tk.Y)
+        self._listbox.bind("<<ListboxSelect>>", self._on_select)
+
+        # Botões de seleção rápida + contador
+        sel_frame = tk.Frame(frame, bg=COR_BG)
+        sel_frame.pack(fill=tk.X, pady=(6, 0))
+        tk.Button(sel_frame, text="Selecionar Todos", command=self._sel_todos,
+                  bg="#eceff1", font=FONT_NORMAL, relief=tk.FLAT).pack(side=tk.LEFT, padx=2)
+        tk.Button(sel_frame, text="Limpar Seleção", command=self._sel_nenhum,
+                  bg="#eceff1", font=FONT_NORMAL, relief=tk.FLAT).pack(side=tk.LEFT, padx=2)
+        self._lbl_sel = tk.Label(sel_frame, text="0 selecionado(s)",
+                                  bg=COR_BG, fg="#555", font=FONT_NORMAL)
+        self._lbl_sel.pack(side=tk.RIGHT)
+
+        # Botões de ação
+        btn_frame = tk.Frame(self, bg=COR_BG, pady=8)
+        btn_frame.pack()
+        self._btn_copiar = tk.Button(btn_frame, text="⬇ Copiar 0 campos", font=FONT_BOLD,
+                                      bg=COR_BTN_LARANJA, fg=COR_BRANCO, relief=tk.FLAT,
+                                      padx=12, pady=4, command=self._confirmar,
+                                      state=tk.DISABLED)
+        self._btn_copiar.pack(side=tk.LEFT, padx=6)
+        tk.Button(btn_frame, text="Cancelar", font=FONT_NORMAL,
+                  bg=COR_BTN_CINZA, fg=COR_BRANCO, relief=tk.FLAT,
+                  padx=12, pady=4, command=self.destroy).pack(side=tk.LEFT, padx=6)
+
+        self.bind("<Escape>", lambda e: self.destroy())
+        self._filtrar()
+
+    def _filtrar(self):
+        filtro = self._var_filtro.get().lower()
+        self._campos_filtrados = [
+            c for c in self._campos
+            if not filtro
+               or filtro in (c.get("nome") or "").lower()
+               or filtro in (c.get("descricao") or "").lower()
+        ]
+        self._listbox.delete(0, tk.END)
+        for c in self._campos_filtrados:
+            nome = c.get("nome", "")
+            extras = []
+            if c.get("tipo"):
+                extras.append(c["tipo"])
+            if c.get("tamanho"):
+                extras.append(f"{c['tamanho']}b")
+            label = f"{nome}  [{', '.join(extras)}]" if extras else nome
+            self._listbox.insert(tk.END, label)
+        self._on_select()
+
+    def _sel_todos(self):
+        self._listbox.select_set(0, tk.END)
+        self._on_select()
+
+    def _sel_nenhum(self):
+        self._listbox.selection_clear(0, tk.END)
+        self._on_select()
+
+    def _on_select(self, _evt=None):
+        n = len(self._listbox.curselection())
+        self._lbl_sel.config(text=f"{n} selecionado(s)")
+        plural = "s" if n != 1 else ""
+        self._btn_copiar.config(
+            text=f"⬇ Copiar {n} campo{plural}",
+            state=tk.NORMAL if n > 0 else tk.DISABLED
+        )
+
+    def _confirmar(self):
+        indices = self._listbox.curselection()
+        resultado = [self._campos_filtrados[i] for i in indices]
+        if self.on_confirmar:
+            self.on_confirmar(resultado)
+        self.destroy()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Aplicação principal
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -624,16 +760,14 @@ class GeradorXMLApp:
                                     fg="#555", font=("Segoe UI", 8))
         self._lbl_origem.pack(side=tk.LEFT, padx=6)
 
-        # ── Copiar campo ─────────────────────────────────────────────────────
-        frc = tk.LabelFrame(bar, text="Copiar Campo da Origem", bg=COR_TOOLBAR,
+        # ── Copiar campos ─────────────────────────────────────────────────────
+        frc = tk.LabelFrame(bar, text="Copiar Campos da Origem", bg=COR_TOOLBAR,
                             font=FONT_NORMAL, padx=4, pady=2)
         frc.pack(side=tk.LEFT, padx=4)
 
-        tk.Label(frc, text="Campo:", bg=COR_TOOLBAR, font=FONT_NORMAL).pack(side=tk.LEFT)
-        self._combo_origem = ttk.Combobox(frc, width=26, state="disabled", font=FONT_NORMAL)
-        self._combo_origem.pack(side=tk.LEFT, padx=4)
-        self._btn(frc, "⬇ Copiar", self.copiar_campo,
+        self._btn_copiar_origem = self._btn(frc, "⬇ Copiar Campos...", self.copiar_campo,
                   COR_BTN_LARANJA, side=tk.LEFT, padx=2)
+        self._btn_copiar_origem.configure(state=tk.DISABLED)
 
         # ── Ações ────────────────────────────────────────────────────────────
         fra = tk.Frame(bar, bg=COR_TOOLBAR)
@@ -764,19 +898,23 @@ class GeradorXMLApp:
         self._btn(parent, "🔄 Atualizar Preview [F7]", self.preview_xml,
                   COR_BTN_ROXO, anchor=tk.NW, pady=(0, 6))
 
-        self._txt_xml = tk.Text(parent, font=FONT_MONO, wrap=tk.NONE,
+        # Sub-frame uses grid internally; parent keeps only pack
+        frm = tk.Frame(parent)
+        frm.pack(fill=tk.BOTH, expand=True)
+
+        self._txt_xml = tk.Text(frm, font=FONT_MONO, wrap=tk.NONE,
                                 bg="#1e1e1e", fg="#d4d4d4",
                                 insertbackground="white",
                                 relief=tk.FLAT)
-        vsb = ttk.Scrollbar(parent, orient=tk.VERTICAL,   command=self._txt_xml.yview)
-        hsb = ttk.Scrollbar(parent, orient=tk.HORIZONTAL, command=self._txt_xml.xview)
+        vsb = ttk.Scrollbar(frm, orient=tk.VERTICAL,   command=self._txt_xml.yview)
+        hsb = ttk.Scrollbar(frm, orient=tk.HORIZONTAL, command=self._txt_xml.xview)
         self._txt_xml.configure(yscrollcommand=vsb.set, xscrollcommand=hsb.set)
 
         self._txt_xml.grid(row=0, column=0, sticky="nsew")
         vsb.grid(row=0, column=1, sticky="ns")
         hsb.grid(row=1, column=0, sticky="ew")
-        parent.rowconfigure(0, weight=1)
-        parent.columnconfigure(0, weight=1)
+        frm.rowconfigure(0, weight=1)
+        frm.columnconfigure(0, weight=1)
 
         # Syntax highlight básico
         self._txt_xml.tag_configure("tag",   foreground="#569cd6")
@@ -845,9 +983,8 @@ class GeradorXMLApp:
         self._origem = campos
         self._arquivo_origem = path
         nomes = [c.get("nome", "") for c in campos if c.get("nome")]
-        self._combo_origem.configure(values=nomes, state="readonly")
         if nomes:
-            self._combo_origem.current(0)
+            self._btn_copiar_origem.configure(state=tk.NORMAL)
 
         nome = os.path.basename(path)
         self._lbl_origem.config(text=nome, fg="#2e7d32")
@@ -878,46 +1015,55 @@ class GeradorXMLApp:
             messagebox.showwarning("Aviso", "Carregue a planilha origem primeiro.")
             return
 
-        sel = self._combo_origem.get().strip()
-        if not sel:
-            messagebox.showwarning("Aviso", "Selecione um campo da origem.")
-            return
-
-        campo_orig = next((c for c in self._origem if c.get("nome") == sel), None)
-        if not campo_orig:
-            messagebox.showerror("Erro", f"Campo '{sel}' não encontrado na origem.")
-            return
-
-        # Verifica se já existe na principal
-        existente = next((c for c in self._campos if c.get("nome") == sel), None)
-
-        if existente:
-            if not messagebox.askyesno("Campo já existe",
-                    f"O campo '{sel}' já existe na planilha principal.\n"
-                    "Deseja substituir os atributos (tamanho, tipo, alinhamento etc.)?"):
+        def _processar(campos_selecionados):
+            if not campos_selecionados:
                 return
-            for key in ("tipo", "tamanho", "alinhamento", "descricao",
-                        "obrigatorio", "coluna_db", "valor_padrao"):
-                if campo_orig.get(key) is not None:
-                    existente[key] = campo_orig[key]
-            if not existente.get("valor"):
-                existente["valor"] = campo_orig.get("valor_padrao", "")
-        else:
-            novo = dict(campo_orig)
-            # Calcula próxima posição disponível
-            ativos_pos = [c for c in self._campos if c.get("pos_ini") and c.get("tamanho")]
-            if ativos_pos:
-                ult = max(ativos_pos, key=lambda c: c["pos_ini"])
-                prox = ult["pos_ini"] + ult["tamanho"]
-            else:
-                prox = 1
-            novo["pos_ini"] = prox
-            if novo.get("tamanho"):
-                novo["pos_fin"] = prox + novo["tamanho"] - 1
-            self._campos.append(novo)
 
-        self._atualizar_tabela()
-        self._set_status(f"Campo '{sel}' copiado da origem para a planilha principal.")
+            novos, duplicatas = [], []
+            for orig in campos_selecionados:
+                nome = orig.get("nome", "")
+                existente = next((c for c in self._campos if c.get("nome") == nome), None)
+                if existente:
+                    duplicatas.append((existente, orig))
+                else:
+                    novos.append(orig)
+
+            # Adiciona campos novos sequencialmente
+            for orig in novos:
+                novo = dict(orig)
+                ativos = [c for c in self._campos if c.get("pos_ini") and c.get("tamanho")]
+                prox = (max(c["pos_ini"] + c["tamanho"] for c in ativos) if ativos else 1)
+                novo["pos_ini"] = prox
+                if novo.get("tamanho"):
+                    novo["pos_fin"] = prox + novo["tamanho"] - 1
+                self._campos.append(novo)
+
+            # Pergunta sobre duplicatas de uma vez só
+            atualizados = 0
+            if duplicatas:
+                nomes_dup = "\n".join(f"  • {e.get('nome')}" for e, _ in duplicatas)
+                if messagebox.askyesno("Campos já existem",
+                        f"Os seguintes campos já existem na planilha principal:\n{nomes_dup}\n\n"
+                        "Deseja atualizar os atributos deles (tipo, tamanho, alinhamento etc.)?"):
+                    for existente, orig in duplicatas:
+                        for key in ("tipo", "tamanho", "alinhamento", "descricao",
+                                    "obrigatorio", "coluna_db", "valor_padrao"):
+                            if orig.get(key) is not None:
+                                existente[key] = orig[key]
+                        if not existente.get("valor"):
+                            existente["valor"] = orig.get("valor_padrao", "")
+                        atualizados += 1
+
+            self._atualizar_tabela()
+            partes = []
+            if novos:
+                partes.append(f"{len(novos)} copiado(s)")
+            if atualizados:
+                partes.append(f"{atualizados} atualizado(s)")
+            if partes:
+                self._set_status(f"Campos da origem: {', '.join(partes)}.")
+
+        JanelaCopiarCampos(self.root, self._origem, on_confirmar=_processar)
 
     # ── Tabela ────────────────────────────────────────────────────────────────
 
