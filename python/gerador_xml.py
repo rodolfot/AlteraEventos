@@ -363,6 +363,26 @@ def salvar_csv(filepath, campos):
 # XML
 # ─────────────────────────────────────────────────────────────────────────────
 
+def _indent_et(elem, level=0):
+    """
+    Indenta um ElementTree in-place para pretty-print (Python 3.8 compatible).
+    Substitui minidom.toprettyxml para XML com prefixos de namespace,
+    evitando o erro "prefix format reserved for internal use" do expat.
+    """
+    pad = "\n" + "\t" * level
+    if len(elem):
+        if not (elem.text or "").strip():
+            elem.text = pad + "\t"
+        for i, child in enumerate(elem):
+            _indent_et(child, level + 1)
+            is_last = (i == len(elem) - 1)
+            if not (child.tail or "").strip():
+                child.tail = pad if is_last else pad + "\t"
+    else:
+        if not (elem.text or "").strip():
+            elem.text = ""
+
+
 def _sanitizar_xml(nome):
     s = re.sub(r"[^a-zA-Z0-9_\-.]", "_", (nome or "campo").strip())
     if s and not (s[0].isalpha() or s[0] == "_"):
@@ -720,7 +740,10 @@ def construir_xml_mapa_atributo(dados_por_aba, filepath=None):
       </ns2:attributeMap>
     """
     NS = "http://rule.saf.cpqd.com.br/"
-    ET.register_namespace("ns2", NS)
+    # "ns2" é reservado internamente pelo ElementTree (Python 3.12+).
+    # Usamos um prefixo seguro e renomeamos no resultado final.
+    _NS_PREFIX = "cpqdns"
+    ET.register_namespace(_NS_PREFIX, NS)
 
     campos_entrada = _aba_campos_entrada(dados_por_aba)
     campos_mapa = [
@@ -777,8 +800,13 @@ def construir_xml_mapa_atributo(dados_por_aba, filepath=None):
             ET.SubElement(attr_el, "description").text  = desc
             ET.SubElement(attr_el, "documentation").text = doc
 
+    # Usa indentador próprio (minidom falha com prefixos de namespace).
+    # Renomeia o prefixo interno → ns2 para corresponder ao gabarito.
+    _indent_et(root_el)
     raw_xml = ET.tostring(root_el, encoding="unicode")
-    return minidom.parseString(raw_xml).toprettyxml(indent="\t")
+    raw_xml = raw_xml.replace(f"{_NS_PREFIX}:", "ns2:")
+    raw_xml = raw_xml.replace(f"xmlns:{_NS_PREFIX}=", "xmlns:ns2=")
+    return '<?xml version="1.0" ?>\n' + raw_xml
 
 
 def construir_xml_enriquecimento(dados_por_aba):
