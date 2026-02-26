@@ -667,18 +667,25 @@ class JanelaEditarCampo(tk.Toplevel):
 # ─────────────────────────────────────────────────────────────────────────────
 
 class JanelaCopiarCampos(tk.Toplevel):
+    """
+    Diálogo de seleção de campos da planilha origem.
+    Exibe uma aba por sheet (estilo Excel) com Listbox de campos em cada uma.
+    Aceita dados_por_aba: {nome_aba: {"campos": list, "headers": list}}
+    """
 
-    def __init__(self, parent, campos_origem, on_confirmar=None):
+    def __init__(self, parent, dados_por_aba, on_confirmar=None):
         super().__init__(parent)
         self.title("Copiar Campos da Origem")
-        self.geometry("480x520")
+        self.geometry("520x560")
         self.resizable(True, True)
-        self.minsize(380, 380)
+        self.minsize(400, 400)
         self.grab_set()
         self.transient(parent)
 
-        self._campos = campos_origem
-        self._campos_filtrados = list(campos_origem)
+        self._dados_por_aba = dados_por_aba
+        self._aba_ativa = ""
+        self._listboxes: dict = {}          # nome_aba → Listbox
+        self._campos_filtrados: dict = {}   # nome_aba → lista filtrada
         self.on_confirmar = on_confirmar
 
         self._build_ui()
@@ -700,23 +707,26 @@ class JanelaCopiarCampos(tk.Toplevel):
         tk.Button(filt_frame, text="✕", command=lambda: self._var_filtro.set(""),
                   bg="#ddd", relief=tk.FLAT, font=FONT_NORMAL).pack(side=tk.LEFT)
 
-        # Instrução
         tk.Label(frame, text="Selecione os campos (Ctrl+Click ou Shift+Click para múltiplos):",
                  bg=COR_BG, font=FONT_NORMAL, anchor=tk.W).pack(fill=tk.X, pady=(0, 4))
 
-        # Listbox
-        list_frame = tk.Frame(frame, bg=COR_BG)
-        list_frame.pack(fill=tk.BOTH, expand=True)
+        # Notebook com uma aba por sheet
+        self._nb = ttk.Notebook(frame)
+        self._nb.pack(fill=tk.BOTH, expand=True)
+        self._nb.bind("<<NotebookTabChanged>>", self._on_tab_changed)
 
-        self._listbox = tk.Listbox(list_frame, selectmode=tk.EXTENDED,
-                                   font=FONT_NORMAL, activestyle="dotbox",
-                                   exportselection=False, relief=tk.FLAT,
-                                   highlightthickness=1, highlightbackground="#bbb")
-        vsb = ttk.Scrollbar(list_frame, orient=tk.VERTICAL, command=self._listbox.yview)
-        self._listbox.configure(yscrollcommand=vsb.set)
-        self._listbox.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        vsb.pack(side=tk.RIGHT, fill=tk.Y)
-        self._listbox.bind("<<ListboxSelect>>", self._on_select)
+        for nome_aba, aba_info in self._dados_por_aba.items():
+            tab_frame = tk.Frame(self._nb, bg=COR_BG, padx=4, pady=4)
+            self._nb.add(tab_frame, text=f"  {nome_aba}  ")
+            lb = self._criar_listbox(tab_frame)
+            self._listboxes[nome_aba] = lb
+            self._campos_filtrados[nome_aba] = list(aba_info.get("campos", []))
+
+        # Seleciona a primeira aba
+        nomes = list(self._dados_por_aba.keys())
+        if nomes:
+            self._aba_ativa = nomes[0]
+            self._nb.select(0)
 
         # Botões de seleção rápida + contador
         sel_frame = tk.Frame(frame, bg=COR_BG)
@@ -744,36 +754,75 @@ class JanelaCopiarCampos(tk.Toplevel):
         self.bind("<Escape>", lambda e: self.destroy())
         self._filtrar()
 
+    def _criar_listbox(self, parent):
+        """Cria e retorna um Listbox com scrollbar dentro do parent."""
+        list_frame = tk.Frame(parent, bg=COR_BG)
+        list_frame.pack(fill=tk.BOTH, expand=True)
+        lb = tk.Listbox(list_frame, selectmode=tk.EXTENDED, font=FONT_NORMAL,
+                        activestyle="dotbox", exportselection=False,
+                        relief=tk.FLAT, highlightthickness=1, highlightbackground="#bbb")
+        vsb = ttk.Scrollbar(list_frame, orient=tk.VERTICAL, command=lb.yview)
+        lb.configure(yscrollcommand=vsb.set)
+        lb.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        vsb.pack(side=tk.RIGHT, fill=tk.Y)
+        lb.bind("<<ListboxSelect>>", self._on_select)
+        return lb
+
+    def _on_tab_changed(self, _evt=None):
+        """Atualiza aba ativa e reseta o contador de seleção."""
+        nomes = list(self._dados_por_aba.keys())
+        tabs = self._nb.tabs()
+        if not tabs:
+            return
+        idx = self._nb.index("current")
+        if idx < len(nomes):
+            self._aba_ativa = nomes[idx]
+        self._on_select()
+
+    def _get_lb(self):
+        """Retorna o Listbox da aba atualmente selecionada."""
+        return self._listboxes.get(self._aba_ativa)
+
     def _filtrar(self):
+        """Aplica filtro de texto em todas as abas."""
         filtro = self._var_filtro.get().lower()
-        self._campos_filtrados = [
-            c for c in self._campos
-            if not filtro
-               or filtro in (c.get("nome") or "").lower()
-               or filtro in (c.get("descricao") or "").lower()
-        ]
-        self._listbox.delete(0, tk.END)
-        for c in self._campos_filtrados:
-            nome = c.get("nome", "")
-            extras = []
-            if c.get("tipo"):
-                extras.append(c["tipo"])
-            if c.get("tamanho"):
-                extras.append(f"{c['tamanho']}b")
-            label = f"{nome}  [{', '.join(extras)}]" if extras else nome
-            self._listbox.insert(tk.END, label)
+        for nome_aba, aba_info in self._dados_por_aba.items():
+            campos = aba_info.get("campos", [])
+            filtrados = [
+                c for c in campos
+                if not filtro
+                   or filtro in (c.get("nome") or "").lower()
+                   or filtro in (c.get("descricao") or "").lower()
+            ]
+            self._campos_filtrados[nome_aba] = filtrados
+            lb = self._listboxes.get(nome_aba)
+            if not lb:
+                continue
+            lb.delete(0, tk.END)
+            for c in filtrados:
+                nome   = c.get("nome", "")
+                extras = []
+                if c.get("tipo"):    extras.append(c["tipo"])
+                if c.get("tamanho"): extras.append(f"{c['tamanho']}b")
+                label = f"{nome}  [{', '.join(extras)}]" if extras else nome
+                lb.insert(tk.END, label)
         self._on_select()
 
     def _sel_todos(self):
-        self._listbox.select_set(0, tk.END)
+        lb = self._get_lb()
+        if lb:
+            lb.select_set(0, tk.END)
         self._on_select()
 
     def _sel_nenhum(self):
-        self._listbox.selection_clear(0, tk.END)
+        lb = self._get_lb()
+        if lb:
+            lb.selection_clear(0, tk.END)
         self._on_select()
 
     def _on_select(self, _evt=None):
-        n = len(self._listbox.curselection())
+        lb = self._get_lb()
+        n = len(lb.curselection()) if lb else 0
         self._lbl_sel.config(text=f"{n} selecionado(s)")
         plural = "s" if n != 1 else ""
         self._btn_copiar.config(
@@ -782,8 +831,13 @@ class JanelaCopiarCampos(tk.Toplevel):
         )
 
     def _confirmar(self):
-        indices = self._listbox.curselection()
-        resultado = [self._campos_filtrados[i] for i in indices]
+        lb = self._get_lb()
+        if not lb:
+            self.destroy()
+            return
+        indices = lb.curselection()
+        filtrados = self._campos_filtrados.get(self._aba_ativa, [])
+        resultado = [filtrados[i] for i in indices]
         if self.on_confirmar:
             self.on_confirmar(resultado)
         self.destroy()
@@ -808,12 +862,16 @@ class GeradorXMLApp:
         self._dados_por_aba: dict = {}      # nome_aba → {"campos": list, "headers": list}
         self._aba_ativa: str = ""           # aba atualmente exibida
         self._headers_ativos: list = []     # headers da aba ativa (ordem original da planilha)
-        self._origem: list = []             # campos da aba ativa da origem
         self._dados_por_aba_origem: dict = {}  # nome_aba → {"campos": list, "headers": list}
-        self._aba_origem_ativa: str = ""    # aba selecionada na origem
         self._arquivo_principal = None
         self._arquivo_origem = None
         self._idx_editando = -1             # índice do campo sendo editado
+
+        # Widgets do notebook de abas (criados em _build_tabela)
+        self._nb_abas = None                # ttk.Notebook da planilha principal
+        self._trees_abas: dict = {}         # nome_aba → Treeview
+        self._tree = None                   # Treeview da aba atualmente ativa
+        self._ignorar_tab_change = False    # evita recursão ao selecionar aba
 
         self._setup_estilos()
         self._build_ui()
@@ -878,18 +936,6 @@ class GeradorXMLApp:
                                        fg="#555", font=("Segoe UI", 8))
         self._lbl_principal.pack(side=tk.LEFT, padx=6)
 
-        # ── Aba ativa ────────────────────────────────────────────────────────
-        fra_aba = tk.LabelFrame(bar, text="Aba", bg=COR_TOOLBAR,
-                                font=FONT_NORMAL, padx=4, pady=2)
-        fra_aba.pack(side=tk.LEFT, padx=4)
-
-        self._var_aba = tk.StringVar()
-        self._combo_aba = ttk.Combobox(fra_aba, textvariable=self._var_aba,
-                                       state="disabled", width=20, font=FONT_NORMAL)
-        self._combo_aba.pack(side=tk.LEFT, padx=2, pady=1)
-        self._combo_aba.bind("<<ComboboxSelected>>",
-                             lambda _: self._mudar_aba(self._var_aba.get()))
-
         # ── Planilha origem ──────────────────────────────────────────────────
         fro = tk.LabelFrame(bar, text="Planilha Origem", bg=COR_TOOLBAR,
                             font=FONT_NORMAL, padx=4, pady=2)
@@ -900,18 +946,6 @@ class GeradorXMLApp:
         self._lbl_origem = tk.Label(fro, text="—", bg=COR_TOOLBAR,
                                     fg="#555", font=("Segoe UI", 8))
         self._lbl_origem.pack(side=tk.LEFT, padx=6)
-
-        # ── Aba origem ───────────────────────────────────────────────────────
-        fra_aba_orig = tk.LabelFrame(bar, text="Aba Origem", bg=COR_TOOLBAR,
-                                     font=FONT_NORMAL, padx=4, pady=2)
-        fra_aba_orig.pack(side=tk.LEFT, padx=4)
-
-        self._var_aba_origem = tk.StringVar()
-        self._combo_aba_origem = ttk.Combobox(fra_aba_orig, textvariable=self._var_aba_origem,
-                                              state="disabled", width=20, font=FONT_NORMAL)
-        self._combo_aba_origem.pack(side=tk.LEFT, padx=2, pady=1)
-        self._combo_aba_origem.bind("<<ComboboxSelected>>",
-                                    lambda _: self._mudar_aba_origem(self._var_aba_origem.get()))
 
         # ── Copiar campos ─────────────────────────────────────────────────────
         frc = tk.LabelFrame(bar, text="Copiar Campos da Origem", bg=COR_TOOLBAR,
@@ -960,42 +994,10 @@ class GeradorXMLApp:
         tk.Button(filt, text="✕", command=lambda: self._var_filtro.set(""),
                   bg="#ddd", relief=tk.FLAT, font=FONT_NORMAL).pack(side=tk.LEFT)
 
-        # Treeview
-        COLS = ("id", "nome", "tipo", "tamanho", "pos_ini", "pos_fin",
-                "alinhamento", "obrig", "valor")
-        HDRS = ("ID", "Nome do Campo", "Tipo", "Tamanho", "Pos.Ini",
-                "Pos.Fin", "Alinhamento", "Obrig.", "Valor")
-        LARG = (38, 185, 85, 68, 60, 60, 130, 50, 140)
-
-        wrap = tk.Frame(parent, bg=COR_BG)
-        wrap.pack(fill=tk.BOTH, expand=True)
-
-        self._tree = ttk.Treeview(wrap, columns=COLS, show="headings",
-                                  selectmode="browse")
-        for col, hdr, larg in zip(COLS, HDRS, LARG):
-            self._tree.heading(col, text=hdr)
-            anc = tk.W if col in ("nome", "valor") else tk.CENTER
-            self._tree.column(col, width=larg, anchor=anc, minwidth=30)
-
-        vsb = ttk.Scrollbar(wrap, orient=tk.VERTICAL,   command=self._tree.yview)
-        hsb = ttk.Scrollbar(wrap, orient=tk.HORIZONTAL, command=self._tree.xview)
-        self._tree.configure(yscrollcommand=vsb.set, xscrollcommand=hsb.set)
-
-        self._tree.grid(row=0, column=0, sticky="nsew")
-        vsb.grid(row=0, column=1, sticky="ns")
-        hsb.grid(row=1, column=0, sticky="ew")
-        wrap.rowconfigure(0, weight=1)
-        wrap.columnconfigure(0, weight=1)
-
-        # Tags de cor
-        self._tree.tag_configure("par",   background="#f5f9ff")
-        self._tree.tag_configure("impar", background=COR_BRANCO)
-        self._tree.tag_configure("erro",  background="#ffebee")
-        self._tree.tag_configure("aviso", background="#fff8e1")
-
-        # Eventos
-        self._tree.bind("<<TreeviewSelect>>", self._on_selecionar)
-        self._tree.bind("<Double-1>",         self._on_duplo_clique)
+        # Notebook de abas (uma por planilha)
+        self._nb_abas = ttk.Notebook(parent)
+        self._nb_abas.pack(fill=tk.BOTH, expand=True)
+        self._nb_abas.bind("<<NotebookTabChanged>>", self._on_tab_changed)
 
         # Barra de ações da tabela
         bbar = tk.Frame(parent, bg=COR_BG, pady=4)
@@ -1146,9 +1148,8 @@ class GeradorXMLApp:
                 (n for n in nomes if _normalizar_chave(n) in ("camposentrada",)),
                 nomes[0]
             )
-            self._combo_aba.configure(values=nomes, state="readonly")
-            self._var_aba.set(aba_padrao)
-            self._mudar_aba(aba_padrao)
+
+            self._reconstruir_abas_principal(dados, aba_padrao)
 
             nome = os.path.basename(path)
             self._lbl_principal.config(text=nome, fg="#1565c0")
@@ -1182,11 +1183,7 @@ class GeradorXMLApp:
         def _sucesso(dados):
             self._dados_por_aba_origem = dados
             self._arquivo_origem = path
-
-            nomes = list(dados.keys())
-            self._combo_aba_origem.configure(values=nomes, state="readonly")
-            self._var_aba_origem.set(nomes[0])
-            self._mudar_aba_origem(nomes[0])
+            self._btn_copiar_origem.configure(state=tk.NORMAL)
 
             nome = os.path.basename(path)
             self._lbl_origem.config(text=nome, fg="#2e7d32")
@@ -1201,24 +1198,108 @@ class GeradorXMLApp:
 
         self._executar_em_thread(_tarefa, _sucesso, _erro, "Carregando planilha origem...")
 
-    def _mudar_aba(self, nome_aba):
-        """Troca a aba ativa e atualiza a tabela de campos."""
+    # ── Abas estilo Excel (notebook) ──────────────────────────────────────────
+
+    def _criar_tree_aba(self, parent, headers):
+        """Cria um Treeview com as colunas originais da aba e retorna o widget."""
+        cols = headers if headers else ["NomeCampo"]
+
+        wrap = tk.Frame(parent, bg=COR_BG)
+        wrap.pack(fill=tk.BOTH, expand=True)
+
+        tree = ttk.Treeview(wrap, columns=cols, show="headings", selectmode="browse")
+        for col in cols:
+            tree.heading(col, text=col)
+            tree.column(col, width=120, anchor=tk.W, minwidth=50)
+
+        vsb = ttk.Scrollbar(wrap, orient=tk.VERTICAL,   command=tree.yview)
+        hsb = ttk.Scrollbar(wrap, orient=tk.HORIZONTAL, command=tree.xview)
+        tree.configure(yscrollcommand=vsb.set, xscrollcommand=hsb.set)
+
+        tree.grid(row=0, column=0, sticky="nsew")
+        vsb.grid(row=0, column=1, sticky="ns")
+        hsb.grid(row=1, column=0, sticky="ew")
+        wrap.rowconfigure(0, weight=1)
+        wrap.columnconfigure(0, weight=1)
+
+        tree.tag_configure("par",   background="#f5f9ff")
+        tree.tag_configure("impar", background=COR_BRANCO)
+        tree.tag_configure("erro",  background="#ffebee")
+        tree.tag_configure("aviso", background="#fff8e1")
+
+        tree.bind("<<TreeviewSelect>>", self._on_selecionar)
+        tree.bind("<Double-1>",         self._on_duplo_clique)
+
+        return tree
+
+    def _reconstruir_abas_principal(self, dados, aba_padrao):
+        """Recria todas as abas do Notebook com os dados carregados."""
+        self._ignorar_tab_change = True
+
+        # Limpa abas e trees anteriores
+        for tab in self._nb_abas.tabs():
+            self._nb_abas.forget(tab)
+        self._trees_abas.clear()
+
+        nomes = list(dados.keys())
+        for nome_aba in nomes:
+            aba_info = dados[nome_aba]
+            headers = aba_info.get("headers", [])
+            campos  = aba_info.get("campos", [])
+
+            frame = tk.Frame(self._nb_abas, bg=COR_BG)
+            self._nb_abas.add(frame, text=f"  {nome_aba}  ")
+
+            tree = self._criar_tree_aba(frame, headers)
+            self._trees_abas[nome_aba] = tree
+
+            # Popula com os dados brutos
+            for i, c in enumerate(campos):
+                raw    = c.get("_raw", {})
+                vals   = tuple(raw.get(h, "") for h in headers) if headers else (c.get("nome", ""),)
+                pos_ini = c.get("pos_ini")
+                tam     = c.get("tamanho")
+                pos_fin = c.get("pos_fin")
+                if pos_ini and tam and pos_fin and pos_ini + tam - 1 != pos_fin:
+                    tag = "erro"
+                elif not pos_ini or not tam:
+                    tag = "aviso"
+                else:
+                    tag = "par" if i % 2 == 0 else "impar"
+                tree.insert("", tk.END, iid=str(i), tags=(tag,), values=vals)
+
+        # Seleciona a aba padrão
+        idx_padrao = nomes.index(aba_padrao) if aba_padrao in nomes else 0
+        self._ignorar_tab_change = False
+        self._nb_abas.select(idx_padrao)
+        # Dispara manualmente (select pode não disparar evento se já estava naquele tab)
+        self._on_tab_changed()
+
+    def _on_tab_changed(self, _evt=None):
+        """Chamado quando o usuário clica em outra aba do notebook."""
+        if self._ignorar_tab_change or not self._nb_abas.tabs():
+            return
+        idx = self._nb_abas.index("current")
+        nomes = list(self._dados_por_aba.keys())
+        if idx >= len(nomes):
+            return
+        nome_aba = nomes[idx]
         self._aba_ativa = nome_aba
         aba = self._dados_por_aba.get(nome_aba, {})
         self._campos = aba.get("campos", [])
         self._headers_ativos = aba.get("headers", [])
-        self._atualizar_tabela()
+        self._tree = self._trees_abas.get(nome_aba)
+        self._lbl_count.config(text=f"{len(self._campos)} campos")
+        self._atualizar_total()
         nome_xml = _nome_xml_para_aba(nome_aba)
         self._set_status(f"Aba: {nome_aba}  ({len(self._campos)} campos)  →  {nome_xml}")
 
-    def _mudar_aba_origem(self, nome_aba):
-        """Troca a aba ativa da planilha origem."""
-        self._aba_origem_ativa = nome_aba
-        aba = self._dados_por_aba_origem.get(nome_aba, {})
-        self._origem = aba.get("campos", [])
-        estado = tk.NORMAL if self._origem else tk.DISABLED
-        self._btn_copiar_origem.configure(state=estado)
-        self._set_status(f"Aba origem: {nome_aba}  ({len(self._origem)} campos disponíveis)")
+    def _mudar_aba(self, nome_aba):
+        """Seleciona a aba pelo nome (usado internamente)."""
+        nomes = list(self._dados_por_aba.keys())
+        if nome_aba in nomes:
+            self._nb_abas.select(nomes.index(nome_aba))
+            self._on_tab_changed()
 
     def _ler_xlsx_generico(self, path):
         """Lê a primeira aba como lista de campos, usando a 1ª linha como cabeçalho."""
@@ -1241,7 +1322,7 @@ class GeradorXMLApp:
     # ── Copiar campo da origem ────────────────────────────────────────────────
 
     def copiar_campo(self):
-        if not self._origem:
+        if not self._dados_por_aba_origem:
             messagebox.showwarning("Aviso", "Carregue a planilha origem primeiro.")
             return
 
@@ -1293,16 +1374,22 @@ class GeradorXMLApp:
             if partes:
                 self._set_status(f"Campos da origem: {', '.join(partes)}.")
 
-        JanelaCopiarCampos(self.root, self._origem, on_confirmar=_processar)
+        JanelaCopiarCampos(self.root, self._dados_por_aba_origem, on_confirmar=_processar)
 
     # ── Tabela ────────────────────────────────────────────────────────────────
 
     def _atualizar_tabela(self):
-        for item in self._tree.get_children():
-            self._tree.delete(item)
+        """Repopula a Treeview da aba ativa com os dados atuais de self._campos."""
+        if not self._tree:
+            return
 
-        filtro = self._var_filtro.get().lower()
-        exib = 0
+        tree    = self._tree
+        headers = self._headers_ativos
+        filtro  = self._var_filtro.get().lower()
+        exib    = 0
+
+        for item in tree.get_children():
+            tree.delete(item)
 
         for i, c in enumerate(self._campos):
             nome = (c.get("nome") or "").lower()
@@ -1310,7 +1397,9 @@ class GeradorXMLApp:
             if filtro and filtro not in nome and filtro not in desc:
                 continue
 
-            # Tag de cor
+            raw  = c.get("_raw", {})
+            vals = tuple(raw.get(h, "") for h in headers) if headers else (c.get("nome", ""),)
+
             pos_ini = c.get("pos_ini")
             tam     = c.get("tamanho")
             pos_fin = c.get("pos_fin")
@@ -1321,20 +1410,7 @@ class GeradorXMLApp:
             else:
                 tag = "par" if i % 2 == 0 else "impar"
 
-            self._tree.insert("", tk.END, iid=str(i), tags=(tag,),
-                values=(
-                    c.get("id", ""),
-                    c.get("nome", ""),
-                    c.get("tipo", ""),
-                    c.get("tamanho", ""),
-                    c.get("pos_ini", ""),
-                    c.get("pos_fin", "") or (
-                        str(pos_ini + tam - 1) if (pos_ini and tam) else ""
-                    ),
-                    c.get("alinhamento", ""),
-                    c.get("obrigatorio", ""),
-                    c.get("valor", ""),
-                ))
+            tree.insert("", tk.END, iid=str(i), tags=(tag,), values=vals)
             exib += 1
 
         self._lbl_count.config(text=f"{exib}/{len(self._campos)} campos")
