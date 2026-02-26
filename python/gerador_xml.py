@@ -111,12 +111,46 @@ def ler_campos_entrada(filepath):
         raise ValueError(f"Formato não suportado: {ext}")
 
 
+def _detectar_secoes(sheet, meta_row_idx):
+    """
+    Lê a linha de metadados (acima do cabeçalho) e retorna {nome_secao: [col_names]}.
+    Usado para delimitar quais colunas pertencem a cada seção XML
+    (ex.: 'Layouts', 'Campos', 'Layout Entrada', 'LayoutPersistencia', ...).
+    """
+    meta_cells = []
+    for cell in sheet[meta_row_idx]:
+        if cell.value and str(cell.value).strip():
+            meta_cells.append((cell.column, str(cell.value).strip()))
+    if not meta_cells:
+        return {}
+
+    # Mapeamento coluna → nome de header na linha seguinte (cabeçalho real)
+    header_row_idx = meta_row_idx + 1
+    col_to_header = {
+        cell.column: str(cell.value).strip()
+        for cell in sheet[header_row_idx]
+        if cell.value
+    }
+
+    sections = {}
+    for i, (sec_col, sec_name) in enumerate(meta_cells):
+        next_col = meta_cells[i + 1][0] if i + 1 < len(meta_cells) else float("inf")
+        sec_headers = [
+            col_to_header[c]
+            for c in sorted(col_to_header)
+            if sec_col <= c < next_col
+        ]
+        sections[sec_name] = sec_headers
+    return sections
+
+
 def _ler_campos_de_sheet(sheet):
     """
     Lê campos de qualquer aba de planilha, detectando cabeçalho e colunas automaticamente.
-    Retorna (campos, headers) onde:
+    Retorna (campos, headers, sections) onde:
       - campos: lista de dicts com chaves padrão + '_raw' (todos os valores pelo header original)
       - headers: lista de nomes de colunas na ordem original da planilha
+      - sections: {nome_secao: [col_names]} detectado da linha de metadados (se existir)
     """
     header_row = _detectar_linha_cabecalho(sheet)
     col_map = _mapear_colunas(sheet, header_row)
@@ -169,7 +203,10 @@ def _ler_campos_de_sheet(sheet):
         }
         campos.append(campo)
 
-    return campos, headers
+    # Detecta seções da linha de metadados acima do cabeçalho (se existir)
+    sections = _detectar_secoes(sheet, header_row - 1) if header_row > 1 else {}
+
+    return campos, headers, sections
 
 
 def _ler_xlsx_campos_entrada(filepath):
@@ -187,7 +224,7 @@ def _ler_xlsx_campos_entrada(filepath):
             f"Abas disponíveis: {', '.join(wb.sheetnames)}"
         )
 
-    campos, _ = _ler_campos_de_sheet(sheet)
+    campos, _, _ = _ler_campos_de_sheet(sheet)
     return campos
 
 
@@ -244,9 +281,9 @@ def ler_todas_abas(filepath):
     for nome_aba in wb.sheetnames:
         ws = wb[nome_aba]
         try:
-            campos, headers = _ler_campos_de_sheet(ws)
+            campos, headers, sections = _ler_campos_de_sheet(ws)
             if campos:
-                resultado[nome_aba] = {"campos": campos, "headers": headers}
+                resultado[nome_aba] = {"campos": campos, "headers": headers, "sections": sections}
         except Exception:
             pass
 
@@ -254,10 +291,17 @@ def ler_todas_abas(filepath):
 
 
 def _nome_xml_para_aba(nome_aba):
-    """Converte nome de aba em identificador XML. Ex: 'Campos Entrada' → 'XML_ENTRADA'."""
-    n = re.sub(r"^[Cc]ampos\s+", "", nome_aba).strip()
-    n = re.sub(r"[\s_\-]+", "_", n).upper()
-    return f"XML_{n}"
+    """Converte nome de aba em nome do elemento XML raiz. Ex: 'Campos Entrada' → 'LayoutEntrada'."""
+    secao = re.sub(r"^[Cc]ampos\s+", "", nome_aba).strip()
+    pascal = "".join(p.capitalize() for p in re.split(r"[\s_\-]+", secao) if p)
+    return f"Layout{pascal}" if pascal else "Layout"
+
+
+def _item_xml_para_aba(nome_aba):
+    """Converte nome de aba em nome do elemento XML de campo. Ex: 'Campos Entrada' → 'CampoEntrada'."""
+    secao = re.sub(r"^[Cc]ampos\s+", "", nome_aba).strip()
+    pascal = "".join(p.capitalize() for p in re.split(r"[\s_\-]+", secao) if p)
+    return f"Campo{pascal}" if pascal else "Campo"
 
 
 def salvar_xlsx(filepath, campos, nome_aba="Campos Entrada"):
@@ -344,72 +388,128 @@ def _aplicar_alinhamento(valor, tamanho, alinhamento, tipo):
     return valor + " " * diff
 
 
-def construir_xml(campos, headers=None):
+def construir_xml(campos, headers=None, nome_aba="", sections=None):
     """
-    Constrói string XML formatada a partir da lista de campos.
-    Se 'headers' for fornecido, usa os nomes originais das colunas da aba como tags XML,
-    respeitando a ordem e as colunas próprias de cada aba.
-    """
-    _NOME_COLS = {"nomecampo", "nome", "campo", "fieldname"}
+    Constrói string XML no formato Layout* (gabarito) a partir dos campos da aba.
 
+    Estrutura gerada:
+      <LayoutEntrada>          ← derivado de nome_aba via _nome_xml_para_aba
+        <Campos>
+          <CampoEntrada>       ← derivado de nome_aba via _item_xml_para_aba
+            <IdentificadorCampo>...
+            ...
+            <Posicao>
+              <PosicaoInicial>...
+              <PosicaoFinal>...
+            </Posicao>
+          </CampoEntrada>
+        </Campos>
+      </LayoutEntrada>
+
+    Parâmetros:
+      headers  - lista de nomes de colunas originais da planilha (ordem natural)
+      nome_aba - nome da aba (determina root/item element names)
+      sections - {nome_secao: [col_names]} lido da linha de metadados da planilha
+    """
+    # ── Nomes dos elementos XML ───────────────────────────────────────────────
+    root_tag = _nome_xml_para_aba(nome_aba) if nome_aba else "Layout"
+    item_tag = _item_xml_para_aba(nome_aba) if nome_aba else "Campo"
+    cont_tag = "Campos"
+
+    # ── Campos ativos (Entrada = S, com posição definida) ─────────────────────
     ativos = sorted(
         [c for c in campos if (c.get("entrada", "S") or "S").upper() == "S" and c.get("pos_ini")],
         key=lambda c: c.get("pos_ini", 0)
     )
-    total = sum(c.get("tamanho", 0) or 0 for c in ativos)
 
-    root = ET.Element("evento")
-    root.set("tamanhoTotal", str(total))
-    root.set("totalCampos", str(len(ativos)))
+    # ── Colunas de posição (vão aninhadas em <Posicao>) ───────────────────────
+    _POS = frozenset(["posicaoinicial", "posinicial", "posicaofinal", "posfinal"])
 
-    campos_el = ET.SubElement(root, "campos")
+    # ── Determinar quais headers emitir e quais são de posição ────────────────
+    if headers and sections:
+        # Colunas de flag de layout (ex.: Entrada, Persistência, Saída…)
+        flag_cols = set(sections.get("Layouts", []))
+
+        # Colunas compartilhadas (seção "Campos")
+        shared = sections.get("Campos", [])
+
+        # Colunas específicas da seção correspondente a esta aba
+        #  "Campos Entrada" → busca seção "Layout Entrada" ou "LayoutEntrada"
+        secao_pascal = re.sub(r"^[Cc]ampos\s+", "", nome_aba).strip()
+        secao_pascal = "".join(p.capitalize() for p in re.split(r"[\s_\-]+", secao_pascal) if p)
+        aba_sec = next(
+            (s for s in sections
+             if re.sub(r"\s+", "", s).lower() == f"layout{secao_pascal.lower()}"),
+            None
+        )
+        specific = sections.get(aba_sec, []) if aba_sec else []
+
+        include_all = [h for h in (shared + specific) if h not in flag_cols]
+
+    elif headers:
+        # Sem metadados de seção: exclui flags conhecidas pelo nome
+        _FLAG_KNOWN = frozenset([
+            "entrada", "persistência", "persistencia",
+            "enriquecimento", "mapaatributo",
+            "saída", "saida", "campoconcatenado",
+        ])
+        include_all = [h for h in headers if _normalizar_chave(h) not in _FLAG_KNOWN]
+    else:
+        include_all = []
+
+    headers_pos = [h for h in include_all if _normalizar_chave(h) in _POS]
+    headers_xml = [h for h in include_all if _normalizar_chave(h) not in _POS]
+
+    # ── Construção do XML ─────────────────────────────────────────────────────
+    root_el = ET.Element(root_tag)
+    cont_el = ET.SubElement(root_el, cont_tag)
 
     for c in ativos:
-        campo_el = ET.SubElement(campos_el, "campo")
+        raw     = c.get("_raw", {})
+        item_el = ET.SubElement(cont_el, item_tag)
 
-        def _sub(tag, val, _el=campo_el):
-            tag_safe = _sanitizar_xml(tag)
-            if val is not None and str(val).strip():
-                e = ET.SubElement(_el, tag_safe)
-                e.text = str(val)
-
-        # Primeiro elemento: NomeCampo
-        _sub("NomeCampo", c.get("nome", ""))
-
-        # Segundo elemento: valor posicionado (calculado)
-        valor = c.get("valor") or c.get("valor_padrao") or ""
-        if c.get("tamanho"):
-            valor = _aplicar_alinhamento(valor, c["tamanho"], c.get("alinhamento", ""), c.get("tipo", ""))
-        _sub("valor", valor)
-
-        if headers and "_raw" in c:
-            # Usa as colunas reais da aba, na ordem do cabeçalho original
-            raw = c["_raw"]
-            for header in headers:
-                if _normalizar_chave(header) in _NOME_COLS:
-                    continue  # NomeCampo já incluído acima
-                val = raw.get(header, "")
+        if headers_xml or headers_pos:
+            # Emite colunas principais (sem flags, sem posição) em ordem
+            for h in headers_xml:
+                val = raw.get(h, "")
                 if val:
-                    _sub(header, val)
+                    e = ET.SubElement(item_el, _sanitizar_xml(h))
+                    e.text = str(val)
+
+            # Emite <Posicao> com PosicaoInicial e PosicaoFinal
+            pos_vals = [(h, raw.get(h, "")) for h in headers_pos]
+            if any(v for _, v in pos_vals):
+                pos_el = ET.SubElement(item_el, "Posicao")
+                for h, v in pos_vals:
+                    if v:
+                        e = ET.SubElement(pos_el, _sanitizar_xml(h))
+                        e.text = str(v)
         else:
-            # Fallback: colunas fixas (campos sem _raw ou sem headers)
-            if c.get("id"):           _sub("id",             str(c["id"]))
-            _sub("tipo",               c.get("tipo") or "TEXTO")
-            if c.get("tamanho"):      _sub("tamanho",        str(c["tamanho"]))
-            if c.get("pos_ini"):      _sub("posicaoInicial", str(c["pos_ini"]))
+            # Fallback sem headers: usa campos processados
+            def _sub(tag, val, _el=item_el):
+                if val is not None and str(val).strip():
+                    e = ET.SubElement(_el, tag)
+                    e.text = str(val)
 
-            pos_fin = c.get("pos_fin")
-            if not pos_fin and c.get("pos_ini") and c.get("tamanho"):
-                pos_fin = c["pos_ini"] + c["tamanho"] - 1
-            if pos_fin:               _sub("posicaoFinal",   str(pos_fin))
+            _sub("IdentificadorCampo", c.get("id", ""))
+            _sub("NomeCampo",          c.get("nome", ""))
+            _sub("DescricaoCampo",     c.get("descricao", ""))
+            _sub("TipoCampo",          c.get("tipo", ""))
+            _sub("TamanhoCampo",       str(c["tamanho"]) if c.get("tamanho") else "")
+            _sub("AlinhamentoCampo",   c.get("alinhamento", ""))
+            _sub("CampoObrigatorio",   c.get("obrigatorio", ""))
 
-            if c.get("alinhamento"):  _sub("alinhamento",    c["alinhamento"])
-            if c.get("obrigatorio"):  _sub("obrigatorio",    c["obrigatorio"])
-            if c.get("descricao"):    _sub("descricao",      c["descricao"])
-            if c.get("coluna_db"):    _sub("colunaDB",       c["coluna_db"])
+            pos_ini = c.get("pos_ini")
+            pos_fin = c.get("pos_fin") or (pos_ini + c["tamanho"] - 1 if pos_ini and c.get("tamanho") else None)
+            if pos_ini or pos_fin:
+                pos_el = ET.SubElement(item_el, "Posicao")
+                if pos_ini:
+                    e = ET.SubElement(pos_el, "PosicaoInicial"); e.text = str(pos_ini)
+                if pos_fin:
+                    e = ET.SubElement(pos_el, "PosicaoFinal");   e.text = str(pos_fin)
 
-    raw_xml = ET.tostring(root, encoding="unicode")
-    return minidom.parseString(raw_xml).toprettyxml(indent="    ")
+    raw_xml = ET.tostring(root_el, encoding="unicode")
+    return minidom.parseString(raw_xml).toprettyxml(indent="\t")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -859,10 +959,11 @@ class GeradorXMLApp:
         self.root.minsize(900, 600)
 
         self._campos: list = []             # campos da aba ativa
-        self._dados_por_aba: dict = {}      # nome_aba → {"campos": list, "headers": list}
+        self._dados_por_aba: dict = {}      # nome_aba → {"campos": list, "headers": list, "sections": dict}
         self._aba_ativa: str = ""           # aba atualmente exibida
         self._headers_ativos: list = []     # headers da aba ativa (ordem original da planilha)
-        self._dados_por_aba_origem: dict = {}  # nome_aba → {"campos": list, "headers": list}
+        self._sections_ativos: dict = {}    # seções de metadados da aba ativa (para construir_xml)
+        self._dados_por_aba_origem: dict = {}  # nome_aba → {"campos": list, "headers": list, "sections": dict}
         self._arquivo_principal = None
         self._arquivo_origem = None
         self._idx_editando = -1             # índice do campo sendo editado
@@ -1288,6 +1389,7 @@ class GeradorXMLApp:
         aba = self._dados_por_aba.get(nome_aba, {})
         self._campos = aba.get("campos", [])
         self._headers_ativos = aba.get("headers", [])
+        self._sections_ativos = aba.get("sections", {})
         self._tree = self._trees_abas.get(nome_aba)
         self._lbl_count.config(text=f"{len(self._campos)} campos")
         self._atualizar_total()
@@ -1583,7 +1685,7 @@ class GeradorXMLApp:
             messagebox.showwarning("Aviso", "Carregue uma planilha primeiro.")
             return
         try:
-            xml_str = construir_xml(self._campos, self._headers_ativos)
+            xml_str = construir_xml(self._campos, self._headers_ativos, self._aba_ativa, self._sections_ativos)
             self._txt_xml.configure(state=tk.NORMAL)
             self._txt_xml.delete(1.0, tk.END)
             self._txt_xml.insert(tk.END, xml_str)
@@ -1620,7 +1722,7 @@ class GeradorXMLApp:
             return
 
         try:
-            xml_str = construir_xml(self._campos, self._headers_ativos)
+            xml_str = construir_xml(self._campos, self._headers_ativos, self._aba_ativa, self._sections_ativos)
             with open(path, "w", encoding="utf-8") as f:
                 f.write(xml_str)
 
