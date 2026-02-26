@@ -30,7 +30,7 @@ public class CamposEntradaPanel extends JPanel {
     private final CamposTableModel tableModel;
     private final JTable tabela;
     private final TableRowSorter<CamposTableModel> sorter;
-    private final JTextField filtroField;
+    private JTextField filtroField;
 
     private final ValidacaoService validacaoService = new ValidacaoService();
 
