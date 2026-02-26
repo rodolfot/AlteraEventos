@@ -1370,6 +1370,10 @@ class GeradorXMLApp:
         self._tree = None                   # Treeview da aba atualmente ativa
         self._ignorar_tab_change = False    # evita recursão ao selecionar aba
 
+        # Widgets de preview XML (criados em _build_painel_direito)
+        self._txt_xmls: dict = {}           # key → tk.Text  (LayoutEntrada, LayoutPersistencia, mapaAtributo, DadoExterno)
+        self._txt_xml  = None               # alias para _txt_xmls["LayoutEntrada"] (compatibilidade)
+
         self._setup_estilos()
         self._build_ui()
         self._bind_atalhos()
@@ -1518,11 +1522,20 @@ class GeradorXMLApp:
         nb.add(frv, text="  Validação  ")
         self._build_aba_validacao(frv)
 
-        # Aba XML Preview
-        frx = tk.Frame(nb, bg=COR_BG, padx=4, pady=4)
-        nb.add(frx, text="  XML Preview  ")
-        self._build_aba_xml(frx)
+        # Abas de XML Preview — uma por tipo de XML gerado
+        _XML_ABAS = [
+            ("LayoutEntrada",      "  LayoutEntrada  "),
+            ("LayoutPersistencia", "  LayoutPersistencia  "),
+            ("mapaAtributo",       "  mapaAtributo  "),
+            ("DadoExterno",        "  DadoExterno  "),
+        ]
+        for key, label in _XML_ABAS:
+            frx = tk.Frame(nb, bg=COR_BG, padx=4, pady=4)
+            nb.add(frx, text=label)
+            self._txt_xmls[key] = self._build_xml_tab(frx, key)
 
+        # Alias de compatibilidade
+        self._txt_xml = self._txt_xmls["LayoutEntrada"]
         self._notebook = nb
 
     def _build_aba_validacao(self, parent):
@@ -1546,32 +1559,33 @@ class GeradorXMLApp:
         self._txt_val.tag_configure("info",   foreground="#1565c0")
         self._txt_val.tag_configure("titulo", font=FONT_BOLD)
 
-    def _build_aba_xml(self, parent):
-        self._btn(parent, "🔄 Atualizar Preview [F7]", self.preview_xml,
+    def _build_xml_tab(self, parent, key):
+        """Cria aba de preview XML com botão de atualização. Retorna o widget Text."""
+        btn_label = "🔄 Atualizar Preview [F7]" if key == "LayoutEntrada" else "🔄 Atualizar Preview"
+        self._btn(parent, btn_label, lambda k=key: self._preview_xml_tab(k),
                   COR_BTN_ROXO, anchor=tk.NW, pady=(0, 6))
 
-        # Sub-frame uses grid internally; parent keeps only pack
         frm = tk.Frame(parent)
         frm.pack(fill=tk.BOTH, expand=True)
 
-        self._txt_xml = tk.Text(frm, font=FONT_MONO, wrap=tk.NONE,
-                                bg="#1e1e1e", fg="#d4d4d4",
-                                insertbackground="white",
-                                relief=tk.FLAT)
-        vsb = ttk.Scrollbar(frm, orient=tk.VERTICAL,   command=self._txt_xml.yview)
-        hsb = ttk.Scrollbar(frm, orient=tk.HORIZONTAL, command=self._txt_xml.xview)
-        self._txt_xml.configure(yscrollcommand=vsb.set, xscrollcommand=hsb.set)
+        txt = tk.Text(frm, font=FONT_MONO, wrap=tk.NONE,
+                      bg="#1e1e1e", fg="#d4d4d4",
+                      insertbackground="white",
+                      relief=tk.FLAT)
+        vsb = ttk.Scrollbar(frm, orient=tk.VERTICAL,   command=txt.yview)
+        hsb = ttk.Scrollbar(frm, orient=tk.HORIZONTAL, command=txt.xview)
+        txt.configure(yscrollcommand=vsb.set, xscrollcommand=hsb.set)
 
-        self._txt_xml.grid(row=0, column=0, sticky="nsew")
+        txt.grid(row=0, column=0, sticky="nsew")
         vsb.grid(row=0, column=1, sticky="ns")
         hsb.grid(row=1, column=0, sticky="ew")
         frm.rowconfigure(0, weight=1)
         frm.columnconfigure(0, weight=1)
 
-        # Syntax highlight básico
-        self._txt_xml.tag_configure("tag",   foreground="#569cd6")
-        self._txt_xml.tag_configure("attr",  foreground="#9cdcfe")
-        self._txt_xml.tag_configure("value", foreground="#ce9178")
+        txt.tag_configure("tag",   foreground="#569cd6")
+        txt.tag_configure("attr",  foreground="#9cdcfe")
+        txt.tag_configure("value", foreground="#ce9178")
+        return txt
 
     def _build_statusbar(self):
         bar = tk.Frame(self.root, bg="#37474f", height=26)
@@ -2076,19 +2090,61 @@ class GeradorXMLApp:
 
     # ── XML ───────────────────────────────────────────────────────────────────
 
-    def preview_xml(self):
-        if not self._campos:
+    # Índice de cada aba XML dentro do notebook (tab 0 = Validação)
+    _XML_TAB_KEYS = ["LayoutEntrada", "LayoutPersistencia", "mapaAtributo", "DadoExterno"]
+
+    def _atualizar_tab_xml(self, key, xml_str):
+        """Popula a aba de XML preview correspondente sem trocar de aba."""
+        txt = self._txt_xmls.get(key)
+        if not txt:
+            return
+        txt.configure(state=tk.NORMAL)
+        txt.delete(1.0, tk.END)
+        txt.insert(tk.END, xml_str)
+        txt.configure(state=tk.DISABLED)
+
+    def _preview_xml_tab(self, key):
+        """Gera e exibe o XML correspondente à chave, selecionando a aba correta."""
+        if not self._dados_por_aba:
             messagebox.showwarning("Aviso", "Carregue uma planilha primeiro.")
             return
         try:
-            xml_str = construir_xml(self._campos, self._headers_ativos, self._aba_ativa, self._sections_ativos)
-            self._txt_xml.configure(state=tk.NORMAL)
-            self._txt_xml.delete(1.0, tk.END)
-            self._txt_xml.insert(tk.END, xml_str)
-            self._txt_xml.configure(state=tk.DISABLED)
-            self._notebook.select(1)
+            if key == "LayoutEntrada":
+                aba_e = None
+                for nome, info in self._dados_por_aba.items():
+                    if _norm_aba(nome) == "camposentrada":
+                        aba_e = info
+                        break
+                if aba_e is None and self._dados_por_aba:
+                    aba_e = next(iter(self._dados_por_aba.values()))
+                xml_str = construir_xml(
+                    aba_e.get("campos", [])   if aba_e else self._campos,
+                    aba_e.get("headers", [])  if aba_e else self._headers_ativos,
+                    "Campos Entrada",
+                    aba_e.get("sections", {}) if aba_e else self._sections_ativos,
+                )
+            elif key == "LayoutPersistencia":
+                xml_str = construir_xml_persistencia(
+                    self._dados_por_aba, self._arquivo_principal
+                )
+            elif key == "mapaAtributo":
+                xml_str = construir_xml_mapa_atributo(
+                    self._dados_por_aba, self._arquivo_principal
+                )
+            elif key == "DadoExterno":
+                xml_str = construir_xml_enriquecimento(self._dados_por_aba)
+            else:
+                return
+
+            self._atualizar_tab_xml(key, xml_str)
+            # Seleciona a aba correta (tab 0 = Validação, tab 1+ = XMLs)
+            self._notebook.select(1 + self._XML_TAB_KEYS.index(key))
         except Exception as e:
-            messagebox.showerror("Erro ao gerar XML", str(e))
+            messagebox.showerror(f"Erro ao gerar {key}", str(e))
+
+    def preview_xml(self):
+        """Atalho F7: gera e exibe o LayoutEntrada."""
+        self._preview_xml_tab("LayoutEntrada")
 
     def gerar_xml(self):
         if not self._dados_por_aba:
@@ -2136,12 +2192,7 @@ class GeradorXMLApp:
             with open(path, "w", encoding="utf-8") as f:
                 f.write(xml_str)
             gerados.append("LayoutEntrada.xml")
-            # Atualiza preview com o LayoutEntrada
-            self._txt_xml.configure(state=tk.NORMAL)
-            self._txt_xml.delete(1.0, tk.END)
-            self._txt_xml.insert(tk.END, xml_str)
-            self._txt_xml.configure(state=tk.DISABLED)
-            self._notebook.select(1)
+            self._atualizar_tab_xml("LayoutEntrada", xml_str)
         except Exception as e:
             erros_geracao.append(f"LayoutEntrada.xml: {e}")
 
@@ -2154,6 +2205,7 @@ class GeradorXMLApp:
             with open(path, "w", encoding="utf-8") as f:
                 f.write(xml_str)
             gerados.append("LayoutPersistencia.xml")
+            self._atualizar_tab_xml("LayoutPersistencia", xml_str)
         except Exception as e:
             erros_geracao.append(f"LayoutPersistencia.xml: {e}")
 
@@ -2166,6 +2218,7 @@ class GeradorXMLApp:
             with open(path, "w", encoding="utf-8") as f:
                 f.write(xml_str)
             gerados.append("mapaAtributo.xml")
+            self._atualizar_tab_xml("mapaAtributo", xml_str)
         except Exception as e:
             erros_geracao.append(f"mapaAtributo.xml: {e}")
 
@@ -2176,6 +2229,7 @@ class GeradorXMLApp:
             with open(path, "w", encoding="utf-8") as f:
                 f.write(xml_str)
             gerados.append("DadoExterno.xml")
+            self._atualizar_tab_xml("DadoExterno", xml_str)
         except Exception as e:
             erros_geracao.append(f"DadoExterno.xml: {e}")
 
@@ -2188,6 +2242,10 @@ class GeradorXMLApp:
             messagebox.showwarning("XMLs gerados com erros", msg)
         else:
             messagebox.showinfo("Sucesso", msg)
+
+        # Seleciona a aba LayoutEntrada para o usuário ver o resultado
+        if gerados:
+            self._notebook.select(1)
 
         self._set_status(
             f"{len(gerados)} XML(s) gerado(s) em: {os.path.basename(dir_saida)}"
