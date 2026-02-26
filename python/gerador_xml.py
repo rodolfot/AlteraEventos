@@ -19,6 +19,7 @@ import openpyxl
 import csv
 import os
 import re
+import threading
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -476,6 +477,50 @@ def validar_campos(campos):
         infos.append(f"Posição final do layout: {ordenados[-1]['pos_ini'] + ordenados[-1]['tamanho'] - 1}")
 
     return erros, avisos, infos
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Janela de carregamento (loading)
+# ─────────────────────────────────────────────────────────────────────────────
+
+class JanelaCarregando(tk.Toplevel):
+    """Diálogo modal com barra de progresso indeterminada exibido durante carregamento."""
+
+    def __init__(self, parent, mensagem="Carregando planilha..."):
+        super().__init__(parent)
+        self.title("Aguarde")
+        self.resizable(False, False)
+        self.transient(parent)
+        self.protocol("WM_DELETE_WINDOW", lambda: None)  # impede fechar
+
+        frm = tk.Frame(self, bg=COR_BG, padx=40, pady=28)
+        frm.pack(fill=tk.BOTH, expand=True)
+
+        tk.Label(frm, text="⏳", bg=COR_BG, font=("Segoe UI", 32)).pack()
+        tk.Label(
+            frm, text=mensagem, bg=COR_BG,
+            font=FONT_BOLD, fg="#333333", wraplength=300
+        ).pack(pady=(10, 14))
+
+        self._bar = ttk.Progressbar(frm, mode="indeterminate", length=280)
+        self._bar.pack()
+        self._bar.start(12)
+
+        # Centraliza sobre o parent
+        self.update_idletasks()
+        px = parent.winfo_rootx() + parent.winfo_width() // 2 - self.winfo_width() // 2
+        py = parent.winfo_rooty() + parent.winfo_height() // 2 - self.winfo_height() // 2
+        self.geometry(f"+{px}+{py}")
+
+        self.grab_set()
+
+    def fechar(self):
+        try:
+            self._bar.stop()
+            self.grab_release()
+            self.destroy()
+        except Exception:
+            pass
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1054,6 +1099,29 @@ class GeradorXMLApp:
 
     # ── Carregar planilhas ────────────────────────────────────────────────────
 
+    def _executar_em_thread(self, tarefa, on_sucesso, on_erro, mensagem="Carregando..."):
+        """
+        Executa `tarefa()` em thread separada enquanto exibe JanelaCarregando.
+        Chama on_sucesso(resultado) ou on_erro(excecao) na thread principal via after().
+        """
+        janela = JanelaCarregando(self.root, mensagem)
+
+        def _runner():
+            try:
+                resultado = tarefa()
+                self.root.after(0, lambda: _finalizar(resultado, None))
+            except Exception as exc:
+                self.root.after(0, lambda e=exc: _finalizar(None, e))
+
+        def _finalizar(resultado, erro):
+            janela.fechar()
+            if erro:
+                on_erro(erro)
+            else:
+                on_sucesso(resultado)
+
+        threading.Thread(target=_runner, daemon=True).start()
+
     def carregar_principal(self):
         path = filedialog.askopenfilename(
             title="Carregar Planilha Principal",
@@ -1061,15 +1129,19 @@ class GeradorXMLApp:
         )
         if not path:
             return
-        try:
-            self._dados_por_aba = ler_todas_abas(path)
-            if not self._dados_por_aba:
+
+        def _tarefa():
+            return ler_todas_abas(path)
+
+        def _sucesso(dados):
+            if not dados:
                 messagebox.showwarning("Aviso", "Nenhuma aba com campos detectados encontrada.")
                 return
 
+            self._dados_por_aba = dados
             self._arquivo_principal = path
 
-            nomes = list(self._dados_por_aba.keys())
+            nomes = list(dados.keys())
             aba_padrao = next(
                 (n for n in nomes if _normalizar_chave(n) in ("camposentrada",)),
                 nomes[0]
@@ -1080,12 +1152,15 @@ class GeradorXMLApp:
 
             nome = os.path.basename(path)
             self._lbl_principal.config(text=nome, fg="#1565c0")
-            total = sum(len(v["campos"]) for v in self._dados_por_aba.values())
+            total = sum(len(v["campos"]) for v in dados.values())
             self._set_status(
-                f"Principal carregada: {nome}  —  {len(self._dados_por_aba)} aba(s), {total} campos"
+                f"Principal carregada: {nome}  —  {len(dados)} aba(s), {total} campos"
             )
-        except Exception as e:
+
+        def _erro(e):
             messagebox.showerror("Erro ao carregar", str(e))
+
+        self._executar_em_thread(_tarefa, _sucesso, _erro, "Carregando planilha principal...")
 
     def carregar_origem(self):
         path = filedialog.askopenfilename(
@@ -1095,36 +1170,36 @@ class GeradorXMLApp:
         if not path:
             return
 
-        try:
+        def _tarefa():
             dados = ler_todas_abas(path)
-        except Exception as e:
-            messagebox.showerror("Erro ao carregar origem", str(e))
-            return
-
-        if not dados:
-            # Fallback: lê a primeira aba genericamente
-            try:
+            if not dados:
+                # Fallback: lê a primeira aba genericamente
                 campos = self._ler_xlsx_generico(path)
-                dados = {os.path.splitext(os.path.basename(path))[0]: {"campos": campos, "headers": []}}
-            except Exception as e:
-                messagebox.showerror("Erro ao carregar origem", str(e))
-                return
+                nome_fallback = os.path.splitext(os.path.basename(path))[0]
+                dados = {nome_fallback: {"campos": campos, "headers": []}}
+            return dados
 
-        self._dados_por_aba_origem = dados
-        self._arquivo_origem = path
+        def _sucesso(dados):
+            self._dados_por_aba_origem = dados
+            self._arquivo_origem = path
 
-        nomes = list(dados.keys())
-        self._combo_aba_origem.configure(values=nomes, state="readonly")
-        self._var_aba_origem.set(nomes[0])
-        self._mudar_aba_origem(nomes[0])
+            nomes = list(dados.keys())
+            self._combo_aba_origem.configure(values=nomes, state="readonly")
+            self._var_aba_origem.set(nomes[0])
+            self._mudar_aba_origem(nomes[0])
 
-        nome = os.path.basename(path)
-        self._lbl_origem.config(text=nome, fg="#2e7d32")
-        n_abas = len(dados)
-        total = sum(len(v["campos"]) for v in dados.values())
-        self._set_status(
-            f"Origem carregada: {nome}  —  {n_abas} aba(s), {total} campos disponíveis"
-        )
+            nome = os.path.basename(path)
+            self._lbl_origem.config(text=nome, fg="#2e7d32")
+            n_abas = len(dados)
+            total = sum(len(v["campos"]) for v in dados.values())
+            self._set_status(
+                f"Origem carregada: {nome}  —  {n_abas} aba(s), {total} campos disponíveis"
+            )
+
+        def _erro(e):
+            messagebox.showerror("Erro ao carregar origem", str(e))
+
+        self._executar_em_thread(_tarefa, _sucesso, _erro, "Carregando planilha origem...")
 
     def _mudar_aba(self, nome_aba):
         """Troca a aba ativa e atualiza a tabela de campos."""
